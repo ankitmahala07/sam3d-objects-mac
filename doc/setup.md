@@ -28,6 +28,12 @@ pip install -e '.[inference]'
 
 ### From HuggingFace
 
+⚠️ Before using SAM 3D Objects, please request access to the checkpoints on the SAM 3D Objects
+Hugging Face [repo](https://huggingface.co/facebook/sam-3d-objects). Once accepted, you
+need to be authenticated to download the checkpoints. You can do this by running
+the following [steps](https://huggingface.co/docs/huggingface_hub/en/quick-start#authentication)
+(e.g. `hf auth login` after generating an access token).
+
 ```bash
 pip install 'huggingface-hub[cli]<1.0'
 
