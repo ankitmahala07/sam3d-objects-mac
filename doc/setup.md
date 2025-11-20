@@ -34,6 +34,9 @@ need to be authenticated to download the checkpoints. You can do this by running
 the following [steps](https://huggingface.co/docs/huggingface_hub/en/quick-start#authentication)
 (e.g. `hf auth login` after generating an access token).
 
+⚠️ SAM 3D Objects is available via HuggingFace globally, **except** in comprehensively sanctioned jurisdictions.
+Sanctioned jurisdiction will result in requests being **rejected**.
+
 ```bash
 pip install 'huggingface-hub[cli]<1.0'
 
@@ -46,3 +49,5 @@ hf download \
 mv checkpoints/${TAG}-download/checkpoints checkpoints/${TAG}
 rm -rf checkpoints/${TAG}-download
 ```
+
+
