@@ -11,6 +11,8 @@ from torch.utils._pytree import tree_map_only
 def set_attention_backend():
     if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(0)
+    else:
+        gpu_name = "CPU"
 
     logger.info(f"GPU name is {gpu_name}")
     if "A100" in gpu_name or "H100" in gpu_name or "H200" in gpu_name:

@@ -298,7 +298,7 @@ def visualize_meshes_interactive(aligned_mesh_path, dfy_mesh_path, output_dir=No
 
     Args:
         aligned_mesh_path: Path to aligned mesh PLY file
-        dfy_mesh_path: Path to 3Dfy GLB file
+        dfy_mesh_path: Path to 3Dfy Object file
         output_dir: Directory to save combined GLB file (defaults to same dir as aligned_mesh_path)
         share: Whether to create a public shareable link (default: True)
         height: Height of the 3D viewer in pixels (default: 600)
@@ -307,6 +307,7 @@ def visualize_meshes_interactive(aligned_mesh_path, dfy_mesh_path, output_dir=No
         tuple: (demo, combined_glb_path) - Gradio demo object and path to combined GLB file
     """
     import gradio as gr
+    import numpy as np
 
     print("Loading meshes for interactive visualization...")
 
@@ -315,17 +316,17 @@ def visualize_meshes_interactive(aligned_mesh_path, dfy_mesh_path, output_dir=No
         aligned_mesh = trimesh.load(aligned_mesh_path)
         print(f"Loaded aligned mesh: {len(aligned_mesh.vertices)} vertices")
 
-        # Load 3Dfy mesh (GLB - handle scene structure)
+        # Load 3Dfy mesh (PLY)
         dfy_scene = trimesh.load(dfy_mesh_path)
 
-        if hasattr(dfy_scene, 'dump'):  # It's a scene
+        if hasattr(dfy_scene, 'dump'):
             dfy_meshes = [geom for geom in dfy_scene.geometry.values() if hasattr(geom, 'vertices')]
             if len(dfy_meshes) == 1:
                 dfy_mesh = dfy_meshes[0]
             elif len(dfy_meshes) > 1:
                 dfy_mesh = trimesh.util.concatenate(dfy_meshes)
             else:
-                raise ValueError("No valid meshes in GLB file")
+                raise ValueError("No valid meshes in PLY file")
         else:
             dfy_mesh = dfy_scene
 
@@ -348,14 +349,42 @@ def visualize_meshes_interactive(aligned_mesh_path, dfy_mesh_path, output_dir=No
             output_dir = os.path.dirname(aligned_mesh_path)
         os.makedirs(output_dir, exist_ok=True)
 
+        # Save combined PLY by concatenating both meshes
+        combined_ply_path = os.path.join(output_dir, 'combined_scene.ply')
+        
+        # Ccombine the geometries for PLY output
+        if isinstance(dfy_mesh, trimesh.points.PointCloud):
+            # Convert point cloud to vertices-only mesh for combination
+            dfy_vertices = dfy_mesh.vertices
+            human_vertices = aligned_mesh.vertices
+            
+            # Combine vertices from both
+            all_vertices = np.vstack([human_vertices, dfy_vertices])
+            
+            # Create colors: red for human, blue for object
+            human_colors = np.array([[255, 0, 0, 200]] * len(human_vertices))
+            object_colors = np.array([[0, 0, 255, 200]] * len(dfy_vertices))
+            all_colors = np.vstack([human_colors, object_colors])
+            
+            # Create combined point cloud
+            combined_cloud = trimesh.points.PointCloud(vertices=all_vertices, colors=all_colors)
+            combined_cloud.export(combined_ply_path)
+        else:
+            # Both are meshes, use scene export
+            scene.export(combined_ply_path)
+        
+        print(f"Exported combined scene to: {combined_ply_path}")
+
+        # Also save GLB for Gradio viewer (NOTE: GLB may not show point cloud object properly)
         combined_glb_path = os.path.join(output_dir, 'combined_scene.glb')
         scene.export(combined_glb_path)
-        print(f"Exported combined scene to: {combined_glb_path}")
+        print(f"Exported GLB for Gradio viewer to: {combined_glb_path}")
+        print("NOTE: Use PLY for complete data, GLB is for Gradio visualization only")
 
         # Create interactive Gradio viewer
         with gr.Blocks() as demo:
             gr.Markdown("# 3D Mesh Alignment Visualization")
-            gr.Markdown("**Red**: SAM 3D Body Aligned Human | **Blue**: 3Dfy Object")
+            gr.Markdown("**Red**: SAM 3D Body Aligned Human | **Blue**: SAM 3D Object")
             gr.Model3D(
                 value=combined_glb_path,
                 label="Combined 3D Scene (Interactive)",
