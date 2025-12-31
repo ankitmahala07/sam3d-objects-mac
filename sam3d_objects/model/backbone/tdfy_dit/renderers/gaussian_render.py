@@ -197,11 +197,18 @@ def render(
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
-    return edict(
-        {
-            "render": rendered_image,
-        }
-    )
+
+    # For gsplat backend, we can also return alpha channel if available
+    result = edict({"render": rendered_image})
+    if backend == "gsplat" and 'render_alphas' in locals():
+        # Add alpha channel to create RGBA output
+        render_alpha = render_alphas.squeeze(0).permute(2, 0, 1)  # Convert to (C, H, W) format
+        result["alpha"] = render_alpha
+        # Also provide RGBA combined format for convenience
+        rgba_image = torch.cat([rendered_image, render_alpha], dim=0)  # (4, H, W)
+        result["rgba"] = rgba_image
+
+    return result
 
 
 class GaussianRenderer:
@@ -315,4 +322,23 @@ class GaussianRenderer:
             ).squeeze()
 
         ret = edict({"color": render_ret["render"]})
+
+        # Pass through alpha and rgba if available (gsplat backend)
+        if "alpha" in render_ret:
+            if ssaa > 1:
+                # Apply same downsampling to alpha channel
+                alpha_downsampled = F.interpolate(
+                    render_ret.alpha[None],
+                    size=(resolution, resolution),
+                    mode="bilinear",
+                    align_corners=False,
+                    antialias=True,
+                ).squeeze()
+                ret["alpha"] = alpha_downsampled
+                # Reconstruct RGBA after downsampling
+                ret["rgba"] = torch.cat([ret["color"], alpha_downsampled], dim=0)
+            else:
+                ret["alpha"] = render_ret["alpha"]
+                ret["rgba"] = render_ret["rgba"]
+
         return ret

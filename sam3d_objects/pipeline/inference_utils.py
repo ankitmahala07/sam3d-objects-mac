@@ -18,6 +18,19 @@ from sam3d_objects.pipeline.layout_post_optimization_utils import (
     run_alignment,
     run_render_compare,
     check_occlusion,
+    get_gs_transformed,
+    get_gs_mask_renderer,
+    run_gs_alignment,
+    run_gs_ICP,
+    apply_gs_transform,
+    run_gs_render_compare_rgb_mask,
+    compute_iou_gs,
+    copy_and_update_gaussian_positions,
+    apply_icp_transformation_to_gaussian,
+    prepare_rgb_for_supervision,
+    flip_coords_pytorch3d_to_opencv,
+    safe_copy_gaussian,
+    get_mask_colors_for_gs,
 )
 
 
@@ -69,37 +82,40 @@ ROTATION_6D_STD = torch.tensor(
 
 def layout_post_optimization(
     Mesh,
-    Quaternion,
-    Translation,
-    Scale,
-    Mask,
-    Point_Map,
-    Intrinsics,
+    quaternion,
+    translation,
+    scale,
+    mask,
+    point_map,
+    intrinsics,
     Enable_shape_ICP=True,
     Enable_rendering_optimization=True,
     min_size=512,
     device=None,
 ):
-
+    logger.info(f"Starting!")
     set_seed(100)
     if device is None:
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        # Get device from input tensors instead of defaulting to cuda:0
+        device = quaternion.device
 
-    # init transform and process mesh
-    Rotation = quaternion_to_matrix(Quaternion.squeeze(1))
-    center = Translation[0].clone()
-    tfm_ori = compose_transform(scale=Scale, rotation=Rotation, translation=Translation)
+    # Initialize transformation and process mesh
+    Rotation = quaternion_to_matrix(quaternion.squeeze(1))
+    center = translation[0].clone()
+    tfm_ori = compose_transform(scale=scale, rotation=Rotation, translation=translation)
     mesh, faces_idx, textures = get_mesh(Mesh, tfm_ori, device)
 
-    # get mask and renderer
-    mask, renderer = get_mask_renderer(Mask, min_size, Intrinsics, device)
+    # Setup renderer
+    mask, renderer = get_mask_renderer(mask, min_size, intrinsics, device)
+    logger.info(f"Loaded!")
 
-    # check occlusion
-    if check_occlusion(mask[0, 0].cpu().numpy(), Point_Map.cpu().numpy()):
+    # Check occlusion
+    if check_occlusion(mask[0, 0].cpu().numpy(), point_map.cpu().numpy()):
+        logger.info(f"Occluded, skipping post-optimization.")
         return (
-            Quaternion,
-            Translation,
-            Scale,
+            quaternion,
+            translation,
+            scale,
             -1.0,
             False,
             False,
@@ -108,16 +124,16 @@ def layout_post_optimization(
     # Step 1: Manual Alignment
     source_points, target_points, center, tfm1, mesh, ori_iou, final_iou, flag_notgt = (
         run_alignment(
-            Point_Map, mask, mesh, center, faces_idx, textures, renderer, device
+            point_map, mask, mesh, center, faces_idx, textures, renderer, device
         )
     )
-
+    logger.info(f"Step 1 Done!")
     # return original layout if no target points. 
     if flag_notgt:
         return (
-            Quaternion,
-            Translation,
-            Scale,
+            quaternion,
+            translation,
+            scale,
             -1.0,
             False,
             False,
@@ -171,7 +187,7 @@ def layout_post_optimization(
             .scale(scale_2.expand(3)[None])
             .translate(translation_2[None])
         )
-
+    logger.info(f"Step 2 Done!")
     # Step 3: Render-and-Compare
     if not Enable_rendering_optimization:
         Flag_optim = False
@@ -203,6 +219,230 @@ def layout_post_optimization(
                 .translate(translation[None])
             )
             tfm = tfm_ori.compose(tfm1).compose(tfm2).compose(tfm3)
+    logger.info(f"Step 3 Done!")
+    M = tfm.get_matrix()[0]
+    T_final = M[3, :3][None]
+    A = M[:3, :3]
+    scale_final = A.norm(dim=1)[None]
+    R_final = A / scale_final[:, None]
+    quat_final = matrix_to_quaternion(R_final)
+
+    return (
+        quat_final,
+        T_final,
+        scale_final,
+        round(float(final_iou), 4),
+        Flag_ICP,
+        Flag_optim,
+    )
+
+def layout_post_optimization_method_GS(
+    gaussian,
+    quaternion,
+    translation,
+    scale,
+    mask,
+    rgb_gt,
+    point_map,
+    intrinsics,
+    Enable_occlusion_check=False,
+    Enable_manual_alignment=False,
+    Enable_shape_ICP=False,
+    Enable_rendering_optimization=True,
+    min_size=512,
+    device=None,
+    backend="gsplat",
+    seed=100,
+):
+    """
+    Gaussian Splatting layout post-optimization function.
+    Similar to layout_post_optimization but works with Gaussian Splatting instead of meshes.
+
+    Args:
+        gaussian: gaussian splatting object with _xyz, _scaling, _rotation, _opacity, _features_dc
+        quaternion: (1, 1, 4) initial rotation quaternion
+        translation: (1, 3) initial translation
+        scale: (1, 3) initial scale
+        mask: (H, W) target mask
+        rgb_gt: (3, H, W) target RGB
+        point_map: (H, W, 3) point cloud map
+        intrinsics: (3, 3) camera intrinsics
+        Enable_occlusion_check: bool, whether to check for occlusion before optimization
+        Enable_manual_alignment: bool, whether to use manual alignment (Step 1)
+        Enable_shape_ICP: bool, whether to use ICP alignment (Step 2)
+        Enable_rendering_optimization: bool, whether to use render-and-compare (Step 3)
+        min_size: int, minimum image size for rendering
+        device: torch device
+        backend: str, "gsplat" or "inria" for GS rendering
+
+    Returns:
+        Tuple of (quaternion, translation, scale, final_iou, initial_iou, Flag_ICP, Flag_optim)
+    """
+    logger.info(f"Starting GS Layout Post-Optimization!")
+    set_seed(seed)
+    if device is None:
+        device = gaussian.get_xyz.device
+
+    # init transform and process gaussian
+    Rotation = quaternion_to_matrix(quaternion)
+    center = translation[0].clone()
+    tfm_ori = compose_transform(scale=scale, rotation=Rotation, translation=translation)
+    scale_factor = scale[0]  # Use full 3D scale vector [sx, sy, sz]
+    gaussian_transformed, initial_positions = get_gs_transformed(gaussian, tfm_ori, scale_factor, device)
+
+    # get mask and renderer
+    mask, renderer, intrinsics_tensor = get_gs_mask_renderer(mask, min_size, intrinsics, device, backend)
+    logger.info(f"Loaded GS renderer with backend: {backend}!")
+
+    # COMPUTE INITIAL IoU
+    gaussian_corrected = safe_copy_gaussian(gaussian_transformed)
+    flip_coords_pytorch3d_to_opencv(gaussian_corrected)
+    rendered_initial = renderer.render(
+        gaussian_corrected,
+        torch.eye(4, device=device, dtype=torch.float32),
+        intrinsics_tensor,
+        colors_overwrite=get_mask_colors_for_gs(gaussian_corrected)
+    )
+    initial_iou = compute_iou_gs(rendered_initial, mask, threshold=0.5)
+    logger.info(f"INITIAL IoU: {initial_iou:.3f}")
+
+    # Check occlusion (optional based on flag)
+    if Enable_occlusion_check:
+        if check_occlusion(mask[0, 0].cpu().numpy(), point_map.cpu().numpy()):
+            logger.info(f"Occluded, skipping post-optimization.")
+            initial_iou_value = round(float(initial_iou.cpu().item()), 4)
+            return (
+                quaternion,
+                translation,
+                scale,
+                initial_iou_value,
+                initial_iou_value,
+                False,
+                False,
+            )
+    else:
+        logger.info(f"Occlusion check skipped (disabled)")
+
+    # Step 1: Manual Alignment
+    if Enable_manual_alignment:
+        source_points, target_points, center, tfm1, gaussian_aligned, ori_iou, final_iou, flag_notgt = (
+            run_gs_alignment(
+                point_map, mask, gaussian_transformed, center, renderer, intrinsics_tensor, device
+            )
+        )
+        logger.info(f"Step 1 Manual Alignment Done!")
+
+        # return original layout if no target points.
+        if flag_notgt:
+            initial_iou_value = round(float(initial_iou.cpu().item()), 4)
+            return (
+                quaternion,
+                translation,
+                scale,
+                initial_iou_value,
+                initial_iou_value,
+                False,
+                False,
+            )
+    else:
+        # Skip manual alignment - use identity transform
+        logger.info(f"Step 1 Manual Alignment Skipped (disabled)")
+        source_points = None
+        target_points = None
+        tfm1 = Transform3d(device=device)  # Identity transform
+        gaussian_aligned = gaussian_transformed  # Use the transformed gaussian as-is
+        ori_iou = initial_iou  # Use the initial IoU computed earlier
+        final_iou = initial_iou  # Start with initial IoU
+        flag_notgt = False
+
+    # Step 2: Shape ICP
+    if Enable_shape_ICP and source_points is not None and target_points is not None:
+        points_aligned_icp, transformation = run_gs_ICP(
+            source_points, target_points, threshold=0.05
+        )
+        gaussian_ICP = copy_and_update_gaussian_positions(
+            gaussian_aligned, points_aligned_icp
+        )
+
+        # Apply ICP transformation to Gaussian parameters (scaling and rotation)
+        R, scale_icp, t = apply_icp_transformation_to_gaussian(gaussian_ICP, transformation, device)
+
+        # Evaluate ICP result by rendering
+        gaussian_ICP_opencv = safe_copy_gaussian(gaussian_ICP)
+        flip_coords_pytorch3d_to_opencv(gaussian_ICP_opencv)
+        rendered = renderer.render(
+            gaussian_ICP_opencv,
+            torch.eye(4, device=device, dtype=torch.float32),
+            intrinsics_tensor,
+            colors_overwrite=get_mask_colors_for_gs(gaussian_ICP_opencv)
+        )
+        ori_iou_shapeICP = compute_iou_gs(rendered, mask, threshold=0.5)
+
+        # Determine whether to accept ICP
+        if ori_iou_shapeICP > ori_iou:
+            Flag_ICP = True
+            gaussian_aligned = gaussian_ICP
+            final_iou = ori_iou_shapeICP.cpu().item()
+            center = ((center[None] * scale_icp) @ R + t)[0]  # Transform center
+            tfm2 = (
+                Transform3d(device=device)
+                .scale(scale_icp[None])
+                .rotate(R[None])
+                .translate(t[None])
+            )
+            logger.info(f"Step 2 ICP: Accepted ICP result (IoU improved: {ori_iou:.3f} → {ori_iou_shapeICP:.3f})")
+        else:
+            Flag_ICP = False
+            tfm2 = Transform3d(device=device)  # Identity transform
+            logger.info(f"Step 2 ICP: Rejected ICP result (IoU not improved: {ori_iou:.3f} → {ori_iou_shapeICP:.3f})")
+    else:
+        Flag_ICP = False
+        tfm2 = Transform3d(device=device)  # Identity transform
+    logger.info(f"Step 2 Done!")
+
+    # Step 3: Render-and-Compare with RGB+Mask Supervision
+    if not Enable_rendering_optimization:
+        Flag_optim = False
+        tfm = tfm_ori.compose(tfm1).compose(tfm2)
+    else:
+        # Prepare RGB image for supervision (handles format conversion and resizing)
+        rgb_gt_processed = prepare_rgb_for_supervision(rgb_gt, mask)
+
+        logger.info(f"Using RGB+mask supervision for render-and-compare")
+        quat, translation, scale, R = run_gs_render_compare_rgb_mask(
+            gaussian_aligned, center, renderer, intrinsics_tensor, mask, rgb_gt_processed, device
+        )
+        with torch.no_grad():
+            transformed = apply_gs_transform(gaussian_aligned, center, quat, translation, scale)
+            transformed_opencv = flip_coords_pytorch3d_to_opencv(transformed)
+            rendered = renderer.render(
+                transformed_opencv,
+                torch.eye(4, device=device, dtype=torch.float32),
+                intrinsics_tensor,
+                colors_overwrite=get_mask_colors_for_gs(transformed_opencv)
+            )
+        optimized_iou = compute_iou_gs(rendered, mask, threshold=0.5)
+
+        # Criterior to use layout optimization
+        if optimized_iou < ori_iou:
+            Flag_optim = False
+            tfm = tfm_ori
+            logger.info(f"Step 3 Render-Compare: Rejected optimization (IoU: {optimized_iou:.3f} ≤ {ori_iou:.3f}")
+        else:
+            Flag_optim = True
+            final_iou = optimized_iou.detach().cpu().item()
+            logger.info(f"Step 3 Render-Compare: Accepted optimization (IoU improved: {ori_iou:.3f} → {optimized_iou:.3f})")
+
+            tfm3 = (
+                Transform3d(device=device)
+                .translate(-center[None])  # move to center
+                .scale(scale.expand(3)[None])
+                .rotate(R.T[None])
+                .translate(center[None])  # move back
+                .translate(translation[None])
+            )
+            tfm = tfm_ori.compose(tfm1).compose(tfm2).compose(tfm3)
+    logger.info(f"Step 3 Done!")
 
     M = tfm.get_matrix()[0]
     T_final = M[3, :3][None]
@@ -216,6 +456,7 @@ def layout_post_optimization(
         T_final,
         scale_final,
         round(float(final_iou), 4),
+        round(float(initial_iou.cpu().item()), 4),
         Flag_ICP,
         Flag_optim,
     )
