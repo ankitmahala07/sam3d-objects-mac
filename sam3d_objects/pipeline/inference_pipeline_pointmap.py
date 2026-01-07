@@ -20,7 +20,7 @@ from sam3d_objects.data.dataset.tdfy.transforms_3d import (
     DecomposedTransform,
 )
 from sam3d_objects.pipeline.utils.pointmap import infer_intrinsics_from_pointmap
-from sam3d_objects.pipeline.inference_utils import o3d_plane_estimation, estimate_plane_area
+from sam3d_objects.pipeline.inference_utils import o3d_plane_estimation, estimate_plane_area, layout_post_optimization, layout_post_optimization_method_GS
 
 
 def camera_to_pytorch3d_camera(device="cpu") -> DecomposedTransform:
@@ -91,10 +91,11 @@ def compile_wrapper(
 class InferencePipelinePointMap(InferencePipeline):
 
     def __init__(
-        self, *args, depth_model, layout_post_optimization_method=None, clip_pointmap_beyond_scale=None, **kwargs
+        self, *args, depth_model, layout_post_optimization_method=layout_post_optimization, layout_post_optimization_method_GS=layout_post_optimization_method_GS, clip_pointmap_beyond_scale=None, **kwargs
     ):
         self.depth_model = depth_model
         self.layout_post_optimization_method = layout_post_optimization_method
+        self.layout_post_optimization_method_GS = layout_post_optimization_method_GS
         self.clip_pointmap_beyond_scale = clip_pointmap_beyond_scale
         super().__init__(*args, **kwargs)
 
@@ -209,6 +210,13 @@ class InferencePipelinePointMap(InferencePipeline):
             item["rgb_pointmap_scale"] = _item["rgb_pointmap_scale"][None].to(self.device)
             item["rgb_pointmap_shift"] = _item["rgb_pointmap_shift"][None].to(self.device)
 
+        # Add unnormed pointmap for post-optimization
+        if pointmap is not None and preprocessor.pointmap_transform != (None,):
+            full_pointmap = self._apply_transform(
+                pointmap, preprocessor.pointmap_transform
+            )
+            item["rgb_pointmap_unnorm"] = full_pointmap[None].to(self.device)            
+
         return item
 
     def _clip_pointmap(self, pointmap: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -237,7 +245,19 @@ class InferencePipelinePointMap(InferencePipeline):
         pointmap_clipped = pointmap_clipped_flat.reshape(pointmap.shape)
         return pointmap_clipped
 
+    def refine_scale(self, revised_scale):
+        # Check if all three channels of revised_scale are close to each other
+        if not torch.allclose(revised_scale[0, 0:1], revised_scale[0, 1:2], atol=1e-3) or \
+           not torch.allclose(revised_scale[0, 0:1], revised_scale[0, 2:3], atol=1e-3):
+            logger.warning(
+                f"revised_scale values are not close (tolerance=1e-3): "
+            )
+        # Use 3-channel mean value
+        revised_scale = revised_scale.clone()
+        mean_val = revised_scale.mean(dim=1, keepdim=True)
+        revised_scale[:] = mean_val
 
+        return revised_scale
 
     def compute_pointmap(self, image, pointmap=None):
         loaded_image = self.image_to_float(image)
@@ -269,25 +289,34 @@ class InferencePipelinePointMap(InferencePipeline):
                     mode="nearest",
                 ).squeeze(0).permute(1, 2, 0)
             intrinsics = None
-
-        points_tensor = points_tensor.permute(2, 0, 1)
-        points_tensor = self._clip_pointmap(points_tensor, loaded_mask)
         
         # Prepare the point map tensor
         point_map_tensor = {
-            "pointmap": points_tensor,
             "pts_color": loaded_image,
         }
 
         # If depth model doesn't provide intrinsics, infer them
         if intrinsics is None:
+            camera_convention_transform = (
+                Transform3d()
+                .rotate(camera_to_pytorch3d_camera(device=self.device).rotation)
+                .to(self.device)
+            )
+            points_tensor_moge = camera_convention_transform.inverse().transform_points(points_tensor)
             intrinsics_result = infer_intrinsics_from_pointmap(
-                points_tensor.permute(1, 2, 0), device=self.device
+                points_tensor_moge, device=self.device
             )
             point_map_tensor["intrinsics"] = intrinsics_result["intrinsics"]
+        else:
+            point_map_tensor["intrinsics"] = intrinsics
+
+        points_tensor = points_tensor.permute(2, 0, 1)
+        points_tensor = self._clip_pointmap(points_tensor, loaded_mask)
+        point_map_tensor["pointmap"] = points_tensor
 
         return point_map_tensor
 
+    @torch.autograd.grad_mode.inference_mode(mode=False)
     def run_post_optimization(self, mesh_glb, intrinsics, pose_dict, layout_input_dict):
         intrinsics = intrinsics.clone()
         fx, fy = intrinsics[0, 0], intrinsics[1, 1]
@@ -300,11 +329,15 @@ class InferencePipelinePointMap(InferencePipeline):
                 pose_dict["translation"],
                 pose_dict["scale"],
                 layout_input_dict["rgb_image_mask"][0, 0],
-                layout_input_dict["rgb_pointmap"][0].permute(1, 2, 0),
+                layout_input_dict["rgb_pointmap_unnorm"][0].permute(1, 2, 0),
                 intrinsics,
+                Enable_shape_ICP=False,
                 min_size=518,
+                device=self.device,
             )
         )
+
+        revised_scale = self.refine_scale(revised_scale)
         return {
             "rotation": revised_quat,
             "translation": revised_t,
@@ -312,6 +345,42 @@ class InferencePipelinePointMap(InferencePipeline):
             "iou": final_iou,
         }
 
+    @torch.autograd.grad_mode.inference_mode(mode=False)
+    def run_post_optimization_GS(self, gs_input, intrinsics, pose_dict, layout_input_dict, backend="gsplat"):
+        intrinsics = intrinsics.clone()
+        fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+        re_focal = min(fx, fy)
+        intrinsics[0, 0], intrinsics[1, 1] = re_focal, re_focal
+
+        revised_quat, revised_t, revised_scale, final_iou, initial_iou, _, flag_optim = (
+            self.layout_post_optimization_method_GS(
+                gs_input,
+                pose_dict["rotation"],
+                pose_dict["translation"],
+                pose_dict["scale"],
+                layout_input_dict["rgb_image_mask"][0, 0],
+                layout_input_dict["rgb_image"][0],
+                layout_input_dict["rgb_pointmap_unnorm"][0].permute(1, 2, 0),
+                intrinsics,
+                Enable_occlusion_check=False,
+                Enable_manual_alignment=False,
+                Enable_shape_ICP=False,
+                Enable_rendering_optimization=True,
+                min_size=518,
+                device=self.device,
+                backend=backend,
+            )
+        )
+
+        revised_scale = self.refine_scale(revised_scale)
+        return {
+            "rotation": revised_quat,
+            "translation": revised_t,
+            "scale": revised_scale,
+            "iou": final_iou,
+            "iou_before_optim": initial_iou,
+            "optim_accepted": flag_optim,
+        }
 
     def run(
         self,
@@ -321,7 +390,7 @@ class InferencePipelinePointMap(InferencePipeline):
         stage1_only=False,
         with_mesh_postprocess=True,
         with_texture_baking=True,
-        with_layout_postprocess=True,
+        with_layout_postprocess=False,
         use_vertex_color=False,
         stage1_inference_steps=None,
         stage2_inference_steps=None,
@@ -392,27 +461,44 @@ class InferencePipelinePointMap(InferencePipeline):
                 outputs, with_mesh_postprocess, with_texture_baking, use_vertex_color
             )
             glb = outputs.get("glb", None)
+            gs_input = outputs.get("gaussian", None)
 
             try:
-                if (
-                    with_layout_postprocess
-                    and self.layout_post_optimization_method is not None
-                ):
-                    assert glb is not None, "require mesh to run postprocessing"
-                    logger.info("Running layout post optimization method...")
-                    postprocessed_pose = self.run_post_optimization(
-                        deepcopy(glb),
-                        pointmap_dict["intrinsics"],
-                        ss_return_dict,
-                        ss_input_dict,
-                    )
-                    ss_return_dict.update(postprocessed_pose)
+                if with_layout_postprocess:
+                    if (
+                        gs_input is not None
+                        and self.layout_post_optimization_method_GS is not None
+                    ):
+                        logger.info("Running GS layout post optimization method...")
+                        postprocessed_pose = self.run_post_optimization_GS(
+                            deepcopy(gs_input[0]),
+                            pointmap_dict["intrinsics"],
+                            ss_return_dict,
+                            ss_input_dict,
+                            backend="gsplat",
+                        )
+                        ss_return_dict.update(postprocessed_pose)
+                        logger.info(f"Finished GS post-optimization!")
+                    elif (
+                        glb is not None
+                        and self.layout_post_optimization_method is not None
+                    ):
+                        logger.info("Running mesh layout post optimization method...")
+                        postprocessed_pose = self.run_post_optimization(
+                            deepcopy(glb),
+                            pointmap_dict["intrinsics"],
+                            ss_return_dict,
+                            ss_input_dict,
+                        )
+                        ss_return_dict.update(postprocessed_pose)
+                        logger.info("Finished mesh post-optimization!")
+                    else:
+                        logger.info("No post-optimization method available (no GS or mesh found)")
             except Exception as e:
                 logger.error(
                     f"Error during layout post optimization: {e}", exc_info=True
                 )
 
-            # glb.export("sample.glb")
             logger.info("Finished!")
 
             return {
