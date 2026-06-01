@@ -23,7 +23,7 @@ SAM 3D Objects is one part of SAM 3D, a pair of models for object and human mesh
 
 ## Latest updates
 
-**11/19/2025** - Encoder weights are out.
+**06/01/2026** - Encoder weights are out.
 **11/19/2025** - Checkpoints Launched, Web Demo and Paper are out.
 
 ## Installation
