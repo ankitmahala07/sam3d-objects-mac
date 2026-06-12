@@ -99,8 +99,12 @@ class InferencePipeline:
         self.compile_model = compile_model
         logger.info(f"self.device: {self.device}")
         logger.info(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', None)}")
-        logger.info(f"Actually using GPU: {torch.cuda.current_device()}")
-        with self.device:
+        if torch.cuda.is_available():
+            logger.info(f"Actually using GPU: {torch.cuda.current_device()}")
+        # torch.device context manager only works for CUDA; use a no-op context otherwise
+        import contextlib
+        _device_ctx = self.device if self.device.type == "cuda" else contextlib.nullcontext()
+        with _device_ctx:
             self.decode_formats = decode_formats
             self.pad_size = pad_size
             self.version = version
@@ -266,12 +270,12 @@ class InferencePipeline:
         ckpt_path,
         state_dict_fn=None,
         state_dict_key="state_dict",
-        device="cuda", 
+        device="cpu",  # load to CPU first, then move to target device
     ):
         model = instantiate(config)
 
         if ckpt_path.endswith(".safetensors"):
-            state_dict = load_file(ckpt_path, device="cuda")
+            state_dict = load_file(ckpt_path, device="cpu")
             if state_dict_fn is not None:
                 state_dict = state_dict_fn(state_dict)
             model.load_state_dict(state_dict, strict=False)
@@ -671,7 +675,7 @@ class InferencePipeline:
         )
 
         with torch.no_grad():
-            with torch.autocast(device_type="cuda", dtype=self.shape_model_dtype):
+            with torch.autocast(device_type=self.device.type, dtype=self.shape_model_dtype):
                 if self.is_mm_dit():
                     latent_shape_dict = {
                         k: (bs,) + (v.pos_emb.shape[0], v.input_layer.in_features)
@@ -749,7 +753,7 @@ class InferencePipeline:
             slat_generator.rescale_t,
         )
 
-        with torch.autocast(device_type="cuda", dtype=self.dtype):
+        with torch.autocast(device_type=self.device.type, dtype=self.dtype):
             with torch.no_grad():
                 condition_args, condition_kwargs = self.get_condition_input(
                     self.condition_embedders["slat_condition_embedder"],

@@ -8,8 +8,12 @@ import torchvision
 from loguru import logger
 from PIL import Image
 
-from pytorch3d.renderer import look_at_view_transform
-from pytorch3d.transforms import Transform3d
+try:
+    from pytorch3d.renderer import look_at_view_transform
+    from pytorch3d.transforms import Transform3d
+except ImportError:
+    look_at_view_transform = None
+    Transform3d = None
 
 from sam3d_objects.model.backbone.dit.embedder.pointmap import PointPatchEmbed
 from sam3d_objects.pipeline.inference_pipeline import InferencePipeline
@@ -267,7 +271,7 @@ class InferencePipelinePointMap(InferencePipeline):
 
         if pointmap is None:
             with torch.no_grad():
-                with torch.autocast(device_type="cuda", dtype=self.dtype):
+                with torch.autocast(device_type=self.device.type, dtype=self.dtype):
                     output = self.depth_model(loaded_image)
             pointmaps = output["pointmaps"]
             camera_convention_transform = (

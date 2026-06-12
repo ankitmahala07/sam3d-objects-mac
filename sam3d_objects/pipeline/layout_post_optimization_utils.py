@@ -3,18 +3,23 @@ import os
 import torch
 import torch.nn.functional as F
 import numpy as np
-from pytorch3d.structures import Meshes
-from pytorch3d.transforms import quaternion_to_matrix
-from pytorch3d.renderer import (
-    PerspectiveCameras,
-    RasterizationSettings,
-    MeshRenderer,
-    MeshRasterizer,
-    SoftSilhouetteShader,
-    BlendParams,
-    TexturesVertex,
-)
-from pytorch3d.transforms import quaternion_to_matrix, Transform3d, matrix_to_quaternion, quaternion_multiply
+try:
+    from pytorch3d.structures import Meshes
+    from pytorch3d.transforms import quaternion_to_matrix
+    from pytorch3d.renderer import (
+        PerspectiveCameras,
+        RasterizationSettings,
+        MeshRenderer,
+        MeshRasterizer,
+        SoftSilhouetteShader,
+        BlendParams,
+        TexturesVertex,
+    )
+    from pytorch3d.transforms import quaternion_to_matrix, Transform3d, matrix_to_quaternion, quaternion_multiply
+except ImportError:
+    Meshes = PerspectiveCameras = RasterizationSettings = MeshRenderer = None
+    MeshRasterizer = SoftSilhouetteShader = BlendParams = TexturesVertex = None
+    quaternion_to_matrix = Transform3d = matrix_to_quaternion = quaternion_multiply = None
 import random
 import open3d as o3d
 from scipy.ndimage import label, binary_dilation, binary_fill_holes, binary_erosion, minimum_filter

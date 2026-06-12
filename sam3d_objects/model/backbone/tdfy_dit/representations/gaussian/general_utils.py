@@ -67,7 +67,7 @@ def get_expon_lr_func(
 
 
 def strip_lowerdiag(L):
-    uncertainty = torch.zeros((L.shape[0], 6), dtype=torch.float, device="cuda")
+    uncertainty = torch.zeros((L.shape[0], 6), dtype=torch.float, device=L.device)
 
     uncertainty[:, 0] = L[:, 0, 0]
     uncertainty[:, 1] = L[:, 0, 1]
@@ -89,7 +89,7 @@ def build_rotation(r):
 
     q = r / norm[:, None]
 
-    R = torch.zeros((q.size(0), 3, 3), device="cuda")
+    R = torch.zeros((q.size(0), 3, 3), device=r.device)
 
     r = q[:, 0]
     x = q[:, 1]
@@ -109,7 +109,7 @@ def build_rotation(r):
 
 
 def build_scaling_rotation(s, r):
-    L = torch.zeros((s.shape[0], 3, 3), dtype=torch.float, device="cuda")
+    L = torch.zeros((s.shape[0], 3, 3), dtype=torch.float, device=s.device)
     R = build_rotation(r)
 
     L[:, 0, 0] = s[:, 0]
@@ -149,4 +149,5 @@ def safe_state(silent):
     random.seed(0)
     np.random.seed(0)
     torch.manual_seed(0)
-    torch.cuda.set_device(torch.device("cuda:0"))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(torch.device("cuda:0"))

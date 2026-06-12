@@ -31,7 +31,10 @@ except ImportError:
         ImportWarning,
     )
 
-from gsplat import rasterization
+try:
+    from gsplat import rasterization
+except ImportError:
+    rasterization = None
 
 
 def intrinsics_to_projection(

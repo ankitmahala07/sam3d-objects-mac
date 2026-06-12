@@ -3,14 +3,18 @@ from collections import namedtuple
 import math
 import torch
 
-from pytorch3d.transforms import (
-    Rotate,
-    Translate,
-    Scale,
-    Transform3d,
-    quaternion_to_matrix,
-    axis_angle_to_quaternion,
-)
+try:
+    from pytorch3d.transforms import (
+        Rotate,
+        Translate,
+        Scale,
+        Transform3d,
+        quaternion_to_matrix,
+        axis_angle_to_quaternion,
+    )
+except ImportError:
+    Rotate = Translate = Scale = Transform3d = None
+    quaternion_to_matrix = axis_angle_to_quaternion = None
 
 DecomposedTransform = namedtuple(
     "DecomposedTransform", ["scale", "rotation", "translation"]

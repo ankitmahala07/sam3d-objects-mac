@@ -24,6 +24,7 @@ def __from_env():
     if env_sparse_backend is not None and env_sparse_backend in [
         "spconv",
         "torchsparse",
+        "native",
     ]:
         BACKEND = env_sparse_backend
     if env_sparse_debug is not None:
@@ -42,7 +43,7 @@ def __from_env():
 __from_env()
 
 
-def set_backend(backend: Literal["spconv", "torchsparse"]):
+def set_backend(backend: Literal["spconv", "torchsparse", "native"]):
     global BACKEND
     BACKEND = backend
 
@@ -52,7 +53,7 @@ def set_debug(debug: bool):
     DEBUG = debug
 
 
-def set_attn(attn: Literal["xformers", "flash_attn"]):
+def set_attn(attn: Literal["xformers", "flash_attn", "sdpa"]):
     global ATTN
     ATTN = attn
 

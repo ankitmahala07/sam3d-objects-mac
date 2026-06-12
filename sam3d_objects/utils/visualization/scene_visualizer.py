@@ -2,9 +2,12 @@
 import torch
 from typing import Optional
 
-from pytorch3d.renderer.cameras import PerspectiveCameras
-from pytorch3d.structures import Pointclouds
-from pytorch3d.transforms import quaternion_to_matrix
+try:
+    from pytorch3d.renderer.cameras import PerspectiveCameras
+    from pytorch3d.structures import Pointclouds
+    from pytorch3d.transforms import quaternion_to_matrix
+except ImportError:
+    PerspectiveCameras = Pointclouds = quaternion_to_matrix = None
 
 from sam3d_objects.data.dataset.tdfy.transforms_3d import compose_transform
 from sam3d_objects.utils.visualization.plotly.plot_scene import plot_tdfy_scene

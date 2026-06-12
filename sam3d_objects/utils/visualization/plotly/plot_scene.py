@@ -42,40 +42,50 @@ import numpy as np
 import plotly.graph_objects as go
 import torch
 from plotly.subplots import make_subplots
-from pytorch3d.renderer import (
-    HeterogeneousRayBundle,
-    RayBundle,
-    TexturesAtlas,
-    TexturesVertex,
-    ray_bundle_to_ray_points,
-)
-from pytorch3d.renderer.camera_utils import camera_to_eye_at_up
-from pytorch3d.renderer.cameras import CamerasBase
-from pytorch3d.structures import (
-    Meshes,
-    Pointclouds,
-    join_meshes_as_scene,
-)
-from pytorch3d.vis.plotly_vis import (
-    AxisArgs,
-    Lighting,
-    _add_camera_trace,
-    _add_pointcloud_trace,
-    _add_ray_bundle_trace,
-    _is_ray_bundle,
-    _scale_camera_to_bounds,
-    _update_axes_bounds,
-)
+try:
+    from pytorch3d.renderer import (
+        HeterogeneousRayBundle,
+        RayBundle,
+        TexturesAtlas,
+        TexturesVertex,
+        ray_bundle_to_ray_points,
+    )
+    from pytorch3d.renderer.camera_utils import camera_to_eye_at_up
+    from pytorch3d.renderer.cameras import CamerasBase
+    from pytorch3d.structures import (
+        Meshes,
+        Pointclouds,
+        join_meshes_as_scene,
+    )
+    from pytorch3d.vis.plotly_vis import (
+        AxisArgs,
+        Lighting,
+        _add_camera_trace,
+        _add_pointcloud_trace,
+        _add_ray_bundle_trace,
+        _is_ray_bundle,
+        _scale_camera_to_bounds,
+        _update_axes_bounds,
+    )
+    _P3D_AVAILABLE = True
+except ImportError:
+    HeterogeneousRayBundle = RayBundle = TexturesAtlas = TexturesVertex = None
+    ray_bundle_to_ray_points = camera_to_eye_at_up = CamerasBase = None
+    Meshes = Pointclouds = join_meshes_as_scene = None
+    AxisArgs = Lighting = None
+    _add_camera_trace = _add_pointcloud_trace = _add_ray_bundle_trace = None
+    _is_ray_bundle = _scale_camera_to_bounds = _update_axes_bounds = None
+    _P3D_AVAILABLE = False
 
 
-Struct = Union[CamerasBase, Meshes, Pointclouds, RayBundle, HeterogeneousRayBundle]
+Struct = object  # simplified when pytorch3d not available
 
 
 default_axisargs = dict(
     xaxis={"backgroundcolor": "rgb(200, 200, 230)"},
     yaxis={"backgroundcolor": "rgb(230, 200, 200)"},
     zaxis={"backgroundcolor": "rgb(200, 230, 200)"},
-    axis_args=AxisArgs(showgrid=True),
+    axis_args=AxisArgs(showgrid=True) if AxisArgs is not None else {},
 )
 
 NO_BACKGROUND = dict(

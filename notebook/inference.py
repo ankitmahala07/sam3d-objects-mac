@@ -2,7 +2,7 @@
 import os
 
 # not ideal to put that here
-os.environ["CUDA_HOME"] = os.environ["CONDA_PREFIX"]
+os.environ["CUDA_HOME"] = os.environ.get("CONDA_PREFIX", os.environ.get("VIRTUAL_ENV", "/usr/local"))
 os.environ["LIDRA_SKIP_INIT"] = "true"
 
 import sys
@@ -22,10 +22,19 @@ import numpy as np
 import gradio as gr
 import matplotlib.pyplot as plt
 from copy import deepcopy
-from kaolin.visualize import IpyTurntableVisualizer
-from kaolin.render.camera import Camera, CameraExtrinsics, PinholeIntrinsics
 import builtins
-from pytorch3d.transforms import quaternion_multiply, quaternion_invert
+# kaolin / pytorch3d are optional (only used for notebook video rendering)
+try:
+    from kaolin.visualize import IpyTurntableVisualizer
+    from kaolin.render.camera import Camera, CameraExtrinsics, PinholeIntrinsics
+    _KAOLIN_VIZ = True
+except Exception:
+    _KAOLIN_VIZ = False
+try:
+    from pytorch3d.transforms import quaternion_multiply, quaternion_invert
+    _P3D = True
+except Exception:
+    _P3D = False
 
 import sam3d_objects  # REMARK(Pierre) : do not remove this import
 from sam3d_objects.pipeline.inference_pipeline_pointmap import InferencePipelinePointMap
@@ -88,6 +97,13 @@ class Inference:
         config.rendering_engine = "pytorch3d"  # overwrite to disable nvdiffrast
         config.compile_model = compile
         config.workspace_dir = os.path.dirname(config_file)
+        # Apple Silicon: use MPS with float16 (bfloat16 is unreliable on MPS)
+        import torch as _torch
+        if _torch.backends.mps.is_available() and not _torch.cuda.is_available():
+            config.device = "mps"
+            config.dtype = "float16"
+            if hasattr(config, "shape_model_dtype") and config.shape_model_dtype is None:
+                config.shape_model_dtype = "float16"
         check_hydra_safety(config, WHITELIST_FILTERS, BLACKLIST_FILTERS)
         self._pipeline: InferencePipelinePointMap = instantiate(config)
 

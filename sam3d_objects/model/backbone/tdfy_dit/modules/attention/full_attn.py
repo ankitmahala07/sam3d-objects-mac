@@ -159,8 +159,9 @@ def scaled_dot_product_attention(*args, **kwargs):
         k = k.permute(0, 2, 1, 3)  # [N, H, L, C]
         v = v.permute(0, 2, 1, 3)  # [N, H, L, C]
         original_dtype = q.dtype
+        _amp_dtype = torch.bfloat16 if device.type == "cuda" else torch.float16
         with torch.nn.attention.sdpa_kernel(backends=[torch.nn.attention.SDPBackend.FLASH_ATTENTION]):
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            with torch.autocast(device_type=device.type, dtype=_amp_dtype):
                 out = torch.nn.functional.scaled_dot_product_attention(q, k, v)  # [N, H, L, C]
         out = out.permute(0, 2, 1, 3)  # [N, L, H, C]
         out = out.to(original_dtype)

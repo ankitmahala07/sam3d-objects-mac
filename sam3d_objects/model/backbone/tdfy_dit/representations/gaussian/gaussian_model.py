@@ -57,14 +57,15 @@ class Gaussian:
 
         self.rotation_activation = torch.nn.functional.normalize
 
+        _dev = torch.device(device) if isinstance(device, str) else device
         self.scale_bias = self.inverse_scaling_activation(
             torch.tensor(self.scaling_bias)
-        ).cuda()
-        self.rots_bias = torch.zeros((4)).cuda()
+        ).to(_dev)
+        self.rots_bias = torch.zeros((4)).to(_dev)
         self.rots_bias[0] = 1
         self.opacity_bias = self.inverse_opacity_activation(
             torch.tensor(self.opacity_bias)
-        ).cuda()
+        ).to(_dev)
 
     @staticmethod
     def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
