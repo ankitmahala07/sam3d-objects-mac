@@ -1,1 +1,31 @@
-__pycache__
+# ── Python ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ── macOS ───────────────────────────────────────────────
+.DS_Store
+
+# ── Model weights (~12 GB) — download from Hugging Face ──
+#    See README "Getting the model weights".
+/checkpoints/hf/
+
+# ── Generated results ───────────────────────────────────
+/outputs/
+
+# ── Virtual environments ────────────────────────────────
+/s3d_env/
+/s3d_env_new/
+env/
+venv/
+.venv/
+
+# ── Editors ─────────────────────────────────────────────
+.idea/
+.vscode/

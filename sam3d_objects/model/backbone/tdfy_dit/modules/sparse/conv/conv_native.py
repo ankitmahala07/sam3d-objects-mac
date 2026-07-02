@@ -75,7 +75,7 @@ def _subm_forward(
                     src_t = torch.tensor(src_idx, device=feats.device)
                     nb_t = torch.tensor(nb_idx, device=feats.device)
                     gathered = feats[nb_t]         # [M, Cin]
-                    contrib = gathered @ W          # [M, Cout]
+                    contrib = (gathered @ W).to(out.dtype)  # [M, Cout]
                     out.index_add_(0, src_t, contrib)
 
     if bias is not None:
@@ -169,7 +169,7 @@ def _sparse_forward(
                 if src_idx_list:
                     src_t = torch.tensor(src_idx_list, device=feats.device)
                     dst_t = torch.tensor(dst_idx_list, device=feats.device)
-                    contrib = feats[src_t] @ W   # [M, Cout]
+                    contrib = (feats[src_t] @ W).to(out_feats.dtype)   # [M, Cout]
                     out_feats.index_add_(0, dst_t, contrib)
 
     if bias is not None:
@@ -389,7 +389,7 @@ class SparseInverseConv3d(nn.Module):
                         src_t = torch.tensor(src_list, device=feats.device)
                         dst_t = torch.tensor(dst_list, device=feats.device)
                         # feats[src] @ W.T  => [M, Cout]
-                        contrib = feats[src_t] @ W.T
+                        contrib = (feats[src_t] @ W.T).to(out_feats.dtype)
                         out_feats.index_add_(0, dst_t, contrib)
 
         if self.bias is not None:

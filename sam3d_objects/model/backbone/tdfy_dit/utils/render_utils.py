@@ -22,10 +22,11 @@ def yaw_pitch_r_fov_to_extrinsics_intrinsics(yaws, pitchs, rs, fovs):
         fovs = [fovs] * len(yaws)
     extrinsics = []
     intrinsics = []
+    _dev = "mps" if torch.backends.mps.is_available() and not torch.cuda.is_available() else "cuda"
     for yaw, pitch, r, fov in zip(yaws, pitchs, rs, fovs):
-        fov = torch.deg2rad(torch.tensor(float(fov))).cuda()
-        yaw = torch.tensor(float(yaw)).cuda()
-        pitch = torch.tensor(float(pitch)).cuda()
+        fov = torch.deg2rad(torch.tensor(float(fov))).to(_dev)
+        yaw = torch.tensor(float(yaw)).to(_dev)
+        pitch = torch.tensor(float(pitch)).to(_dev)
         orig = (
             torch.tensor(
                 [
@@ -33,13 +34,13 @@ def yaw_pitch_r_fov_to_extrinsics_intrinsics(yaws, pitchs, rs, fovs):
                     torch.cos(yaw) * torch.cos(pitch),
                     torch.sin(pitch),
                 ]
-            ).cuda()
+            ).to(_dev)
             * r
         )
         extr = utils3d.torch.extrinsics_look_at(
             orig,
-            torch.tensor([0, 0, 0]).float().cuda(),
-            torch.tensor([0, 0, 1]).float().cuda(),
+            torch.tensor([0, 0, 0]).float().to(_dev),
+            torch.tensor([0, 0, 1]).float().to(_dev),
         )
         intr = utils3d.torch.intrinsics_from_fov_xy(fov, fov)
         extrinsics.append(extr)
@@ -187,11 +188,12 @@ def render_multiview(sample, resolution=512, nviews=30):
     extrinsics, intrinsics = yaw_pitch_r_fov_to_extrinsics_intrinsics(
         yaws, pitchs, r, fov
     )
+    _backend = "gsplat" if (torch.backends.mps.is_available() and not torch.cuda.is_available()) else "inria"
     res = render_frames(
         sample,
         extrinsics,
         intrinsics,
-        {"resolution": resolution, "bg_color": (0, 0, 0)},
+        {"resolution": resolution, "bg_color": (0, 0, 0), "backend": _backend},
     )
     return res["color"], extrinsics, intrinsics
 

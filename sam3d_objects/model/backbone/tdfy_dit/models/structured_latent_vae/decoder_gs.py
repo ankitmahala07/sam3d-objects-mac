@@ -120,6 +120,7 @@ class SLatGaussianDecoder(SparseTransformerBase):
                 scaling_bias=self.rep_config["scaling_bias"],
                 opacity_bias=self.rep_config["opacity_bias"],
                 scaling_activation=self.rep_config["scaling_activation"],
+                device=x.feats.device,
             )
             xyz = (x.coords[x.layout[i]][:, 1:].float() + 0.5) / self.resolution
             for k, v in self.layout.items():

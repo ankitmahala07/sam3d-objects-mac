@@ -32,9 +32,23 @@ except ImportError:
     )
 
 try:
-    from gsplat import rasterization
+    from gsplat import rasterization as _gsplat_rasterization
 except ImportError:
-    rasterization = None
+    _gsplat_rasterization = None
+
+# Pure-PyTorch fallback that runs on MPS / CPU (gsplat ships CUDA-only kernels).
+from .gsplat_silicon import rasterization as _silicon_rasterization
+
+
+def _select_rasterization(device):
+    """Use real gsplat on CUDA; the silicon rasterizer everywhere else."""
+    if getattr(device, "type", None) == "cuda" and _gsplat_rasterization is not None:
+        return _gsplat_rasterization
+    return _silicon_rasterization
+
+
+# Back-compat alias: prefer gsplat if importable, else the silicon path.
+rasterization = _gsplat_rasterization if _gsplat_rasterization is not None else _silicon_rasterization
 
 
 def intrinsics_to_projection(
@@ -107,10 +121,11 @@ def render(
     # Backend-specific rasterization setup and execution
     if backend == "inria":
         kernel_size = pipe.kernel_size
+        _gs_dev = pc.get_xyz.device
         subpixel_offset = torch.zeros(
             (int(viewpoint_camera.image_height), int(viewpoint_camera.image_width), 2),
             dtype=torch.float32,
-            device="cuda",
+            device=_gs_dev,
         )
 
         # Set up rasterization configuration
@@ -120,7 +135,7 @@ def render(
         # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
         screenspace_points = (
             torch.zeros_like(
-                pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda"
+                pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device=pc.get_xyz.device
             )
             + 0
         )
@@ -181,7 +196,8 @@ def render(
         gsplat_colors = colors_precomp if colors_precomp is not None else shs
         gsplat_sh_degree = pc.active_sh_degree if shs is not None else None
 
-        render_colors, render_alphas, meta = rasterization(
+        _rasterization = _select_rasterization(means3D.device)
+        render_colors, render_alphas, meta = _rasterization(
             means=means3D,
             quats=rotations,
             scales=scales,
@@ -271,13 +287,14 @@ class GaussianRenderer:
         far = self.rendering_options["far"]
         ssaa = self.rendering_options["ssaa"]
 
+        _render_dev = extrinsics.device if hasattr(extrinsics, 'device') else torch.device("mps" if torch.backends.mps.is_available() and not torch.cuda.is_available() else "cuda")
         if self.rendering_options["bg_color"] == "random":
-            self.bg_color = torch.zeros(3, dtype=torch.float32, device="cuda")
+            self.bg_color = torch.zeros(3, dtype=torch.float32, device=_render_dev)
             if np.random.rand() < 0.5:
                 self.bg_color += 1
         else:
             self.bg_color = torch.tensor(
-                self.rendering_options["bg_color"], dtype=torch.float32, device="cuda"
+                self.rendering_options["bg_color"], dtype=torch.float32, device=_render_dev
             )
 
         view = extrinsics

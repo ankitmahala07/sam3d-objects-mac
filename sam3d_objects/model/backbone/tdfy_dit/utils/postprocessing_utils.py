@@ -44,61 +44,51 @@ def _fill_holes(
         num_views (int): Number of views to rasterize the mesh.
         verbose (bool): Whether to print progress.
     """
-    # Construct cameras
+    device = verts.device
+    # Construct cameras on CPU (utils3d uses float64 internally, which MPS rejects), then
+    # move the small [4,4] matrices to the mesh's device for rasterization.
     yaws = []
     pitchs = []
     for i in range(num_views):
         y, p = sphere_hammersley_sequence(i, num_views)
         yaws.append(y)
         pitchs.append(p)
-    yaws = torch.tensor(yaws).cuda()
-    pitchs = torch.tensor(pitchs).cuda()
+    yaws = torch.tensor(yaws)
+    pitchs = torch.tensor(pitchs)
     radius = 2.0
-    fov = torch.deg2rad(torch.tensor(40)).cuda()
-    projection = utils3d.torch.perspective_from_fov_xy(fov, fov, 1, 3)
+    fov = torch.deg2rad(torch.tensor(40))
+    projection = utils3d.torch.perspective_from_fov_xy(fov, fov, 1, 3).to(device).float()
     views = []
     for yaw, pitch in zip(yaws, pitchs):
-        orig = (
-            torch.tensor(
-                [
-                    torch.sin(yaw) * torch.cos(pitch),
-                    torch.cos(yaw) * torch.cos(pitch),
-                    torch.sin(pitch),
-                ]
-            )
-            .cuda()
-            .float()
-            * radius
-        )
+        orig = torch.stack(
+            [
+                torch.sin(yaw) * torch.cos(pitch),
+                torch.cos(yaw) * torch.cos(pitch),
+                torch.sin(pitch),
+            ]
+        ).float() * radius
         view = utils3d.torch.view_look_at(
             orig,
-            torch.tensor([0, 0, 0]).float().cuda(),
-            torch.tensor([0, 0, 1]).float().cuda(),
+            torch.tensor([0, 0, 0]).float(),
+            torch.tensor([0, 0, 1]).float(),
         )
         views.append(view)
-    views = torch.stack(views, dim=0)
+    views = torch.stack(views, dim=0).to(device).float()
 
-    # Rasterize
-    visblity = torch.zeros(faces.shape[0], dtype=torch.int32, device=verts.device)
-    rastctx = utils3d.torch.RastContext(backend="cuda")
+    # Rasterize with the pure-PyTorch z-buffered rasterizer (CUDA-free).
+    from ..renderers.mesh_raster_silicon import rasterize_mesh
+    visblity = torch.zeros(faces.shape[0], dtype=torch.int32, device=device)
     for i in tqdm(
         range(views.shape[0]),
         total=views.shape[0],
         disable=not verbose,
         desc="Rasterizing",
     ):
-        view = views[i]
-        buffers = utils3d.torch.rasterize_triangle_faces(
-            rastctx,
-            verts[None],
-            faces,
-            resolution,
-            resolution,
-            view=view,
-            projection=projection,
-        )
-        face_id = buffers["face_id"][0][buffers["mask"][0] > 0.95] - 1
-        face_id = torch.unique(face_id).long()
+        mvp = projection @ views[i]
+        buffers = rasterize_mesh(verts, faces, mvp, resolution, resolution)
+        face_id = buffers["face_id"][buffers["mask"]]   # already 0-based, -1 = empty
+        face_id = torch.unique(face_id)
+        face_id = face_id[face_id >= 0].long()
         visblity[face_id] += 1
     visblity = visblity.float() / num_views
 
@@ -266,8 +256,8 @@ def _fill_holes(
     mesh.fill_small_boundaries(nbe=max_hole_nbe, refine=True)
     verts, faces = mesh.return_arrays()
     verts, faces = torch.tensor(
-        verts, device="cuda", dtype=torch.float32
-    ), torch.tensor(faces, device="cuda", dtype=torch.int32)
+        verts, device=device, dtype=torch.float32
+    ), torch.tensor(faces, device=device, dtype=torch.int32)
 
     return verts, faces
 
@@ -282,6 +272,8 @@ def postprocess_mesh(
     fill_holes_max_hole_nbe: int = 32,
     fill_holes_resolution: int = 1024,
     fill_holes_num_views: int = 1000,
+    remove_floaters: bool = True,
+    floater_frac: float = 0.01,
     debug: bool = False,
     verbose: bool = False,
 ):
@@ -306,11 +298,18 @@ def postprocess_mesh(
             f"Before postprocess: {vertices.shape[0]} vertices, {faces.shape[0]} faces"
         )
 
+    # Device for the torch-based steps below (MPS / CPU / CUDA).
+    _dev = "mps" if torch.backends.mps.is_available() and not torch.cuda.is_available() else (
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
+
     # Simplify
     if simplify and simplify_ratio > 0:
         mesh = pv.PolyData(
             vertices, np.concatenate([np.full((faces.shape[0], 1), 3), faces], axis=1)
         )
+        # pyvista.decimate requires an all-triangle mesh; triangulate first to be safe.
+        mesh = mesh.triangulate()
         mesh = mesh.decimate(simplify_ratio, progress_bar=verbose)
         vertices, faces = mesh.points, mesh.faces.reshape(-1, 4)[:, 1:]
         if verbose:
@@ -321,8 +320,8 @@ def postprocess_mesh(
     # Remove invisible faces
     if fill_holes:
         vertices, faces = (
-            torch.tensor(vertices).cuda(),
-            torch.tensor(faces.astype(np.int32)).cuda(),
+            torch.tensor(vertices).to(_dev),
+            torch.tensor(faces.astype(np.int32)).to(_dev),
         )
         vertices, faces = _fill_holes(
             vertices,
@@ -339,6 +338,28 @@ def postprocess_mesh(
             tqdm.write(
                 f"After remove invisible faces: {vertices.shape[0]} vertices, {faces.shape[0]} faces"
             )
+
+    # Drop small disconnected pieces ("floaters"): decimation + mincut can leave dozens
+    # of tiny islands. Keep only components with at least floater_frac of the largest
+    # component's face count (with a small absolute floor).
+    if remove_floaters:
+        ft = torch.tensor(faces.astype(np.int64), device=_dev)
+        vt = torch.tensor(vertices, device=_dev).float()
+        ccs = utils3d.torch.compute_connected_components(ft)
+        if len(ccs) > 1:
+            largest = max(len(cc) for cc in ccs)
+            thresh = max(50, int(floater_frac * largest))
+            keep = [cc for cc in ccs if len(cc) >= thresh]
+            if keep:
+                keep_idx = torch.cat(keep)
+                ft = ft[keep_idx]
+                ft, vt = utils3d.torch.remove_unreferenced_vertices(ft, vt)
+                vertices, faces = vt.cpu().numpy(), ft.cpu().numpy()
+                if verbose:
+                    tqdm.write(
+                        f"After floater removal: kept {len(keep)}/{len(ccs)} components, "
+                        f"{vertices.shape[0]} vertices, {faces.shape[0]} faces"
+                    )
 
     return vertices, faces
 
@@ -372,13 +393,16 @@ def bake_texture(
     texture_size: int = 2048,
     near: float = 0.1,
     far: float = 10.0,
-    mode: Literal["fast", "opt"] = "opt",
+    mode: Literal["fast", "opt", "average"] = "opt",
     lambda_tv: float = 1e-2,
     verbose: bool = False,
     rendering_engine: str = "nvdiffrast",  # nvdiffrast OR "pytorch3d"
-    device: str = "cuda",
+    device: str = None,
 
 ):
+    if device is None:
+        import torch as _t
+        device = "mps" if _t.backends.mps.is_available() and not _t.cuda.is_available() else "cuda"
     """
     Bake texture to a mesh from multiple observations.
 
@@ -470,11 +494,36 @@ def bake_texture(
         texture = cv2.inpaint(texture, mask, 3, cv2.INPAINT_TELEA)
 
     elif mode == "opt":
-        rastctx = utils3d.torch.RastContext(backend=device if device.startswith("cuda") else "cuda")
-        observations = [observations.flip(0) for observations in observations]
-        masks = [m.flip(0) for m in masks]
+        # NOTE: do NOT flip observations/masks vertically here. The z-buffered
+        # _software_rasterize_uv below produces UV maps in the same top-left-origin
+        # orientation as the rendered observations (verified: the pinhole projection
+        # matches the renderer exactly). Flipping would vertically mirror each
+        # observation against its UV map, so 100 conflicting views average to mud.
         _uv = []
         _uv_dr = []
+
+        def _software_rasterize_uv(vertices, faces, uvs, H, W, view, projection):
+            """Z-buffered CPU/MPS UV rasterization (pure PyTorch, no CUDA).
+
+            Uses a proper depth test so occluded back-faces no longer overwrite visible
+            ones, then interpolates per-pixel UV with perspective-correct barycentrics.
+            """
+            from ..renderers.mesh_raster_silicon import rasterize_mesh
+            verts = vertices[0]                       # [V, 3]
+            uvs_ = uvs[0] if uvs.ndim == 3 else uvs   # [V, 2]
+            mvp = projection @ view                   # [4, 4]
+
+            out = rasterize_mesh(verts, faces, mvp, H, W)
+            fid = out["face_id"]                      # [H, W]  (-1 where empty)
+            bary = out["bary"]                        # [H, W, 3]
+            mask_map = out["mask"]                    # [H, W]
+
+            face_vidx = faces[fid.clamp_min(0)]       # [H, W, 3] vertex ids per pixel
+            face_uv = uvs_[face_vidx]                 # [H, W, 3, 2]
+            uv_map = (bary.unsqueeze(-1) * face_uv).sum(dim=2)        # [H, W, 2]
+            uv_map = torch.where(mask_map.unsqueeze(-1), uv_map, torch.zeros_like(uv_map))
+            return {"uv": uv_map.unsqueeze(0), "mask": mask_map.unsqueeze(0)}
+
         for observation, view, projection in tqdm(
             zip(observations, views, projections),
             total=len(views),
@@ -482,18 +531,17 @@ def bake_texture(
             desc="Texture baking (opt): UV",
         ):
             with torch.no_grad():
-                rast = utils3d.torch.rasterize_triangle_faces(
-                    rastctx,
+                rast = _software_rasterize_uv(
                     vertices[None],
                     faces,
-                    observation.shape[1],
+                    uvs[None],
                     observation.shape[0],
-                    uv=uvs[None],
-                    view=view,
-                    projection=projection,
+                    observation.shape[1],
+                    view,
+                    projection,
                 )
                 _uv.append(rast["uv"].detach())
-                _uv_dr.append(rast["uv_dr"].detach())
+                _uv_dr.append(rast["uv"].detach())  # uv_dr unused with pytorch3d engine
 
         texture = torch.nn.Parameter(
             torch.zeros((1, texture_size, texture_size, 3), dtype=torch.float32).to(device)
@@ -569,13 +617,64 @@ def bake_texture(
                     )
                 pbar.set_postfix({"loss": loss.item()})
                 pbar.update()
+        # Texture is baked in the natural UV convention (row = v, col = u, origin
+        # top-left) — matching the unflipped observations. Do inpainting in this same
+        # space, then apply ONE vertical flip at the very end (below) to compensate for
+        # trimesh's V-flip on GLB export, so standard glTF viewers sample it correctly.
         texture = np.clip(
-            texture[0].flip(0).detach().cpu().numpy() * 255, 0, 255
+            texture[0].detach().cpu().numpy() * 255, 0, 255
         ).astype(np.uint8)
-        mask = 1 - utils3d.torch.rasterize_triangle_faces(
-            rastctx, (uvs * 2 - 1)[None], faces, texture_size, texture_size
-        )["mask"][0].detach().cpu().numpy().astype(np.uint8)
+        # Build inpaint mask: pixels not covered by any UV triangle
+        uv_coverage = torch.zeros(texture_size, texture_size, device=vertices.device, dtype=torch.bool)
+        uvs_px = (uvs * texture_size).long().clamp(0, texture_size - 1)
+        tri_uvs_px = uvs_px[faces]  # [F, 3, 2]
+        for (a, b, c) in [(0.5,0.25,0.25),(0.25,0.5,0.25),(0.25,0.25,0.5),(1/3,1/3,1/3)]:
+            px = (a*tri_uvs_px[:,0]+b*tri_uvs_px[:,1]+c*tri_uvs_px[:,2]).long()
+            xi = px[:,0].clamp(0,texture_size-1)
+            yi = px[:,1].clamp(0,texture_size-1)
+            uv_coverage[yi, xi] = True
+        mask = (1 - uv_coverage.cpu().numpy().astype(np.uint8)).astype(np.uint8)
         texture = cv2.inpaint(texture, mask, 3, cv2.INPAINT_TELEA)
+        # Compensate trimesh's GLB-export V-flip (it stores uv.v -> 1-uv.v): flip the
+        # texture vertically so a standard glTF viewer samples the correct texels.
+        texture = np.ascontiguousarray(texture[::-1])
+
+    elif mode == "average":
+        # Deterministic angle-weighted multi-view average using the z-buffered software
+        # rasterizer. Produces a smooth, continuous "proper finish" (no stochastic Adam
+        # patchiness / dabs), and is faster than opt. Best for the MPS / pytorch3d path.
+        from ..renderers.mesh_raster_silicon import rasterize_mesh
+        faces_l = faces.long()
+        v0 = vertices[faces_l[:, 0]]; v1 = vertices[faces_l[:, 1]]; v2 = vertices[faces_l[:, 2]]
+        face_n = torch.nn.functional.normalize(torch.cross(v1 - v0, v2 - v0, dim=1), dim=1)  # [F,3]
+        H = observations[0].shape[0]; W = observations[0].shape[1]
+        tex_sum = torch.zeros(texture_size * texture_size, 3, device=device)
+        tex_w = torch.zeros(texture_size * texture_size, device=device)
+        for i in range(len(observations)):
+            mvp = projections[i] @ views[i]
+            out = rasterize_mesh(vertices, faces_l, mvp, H, W)
+            fid = out["face_id"]; m = out["mask"]
+            if not bool(m.any()):
+                continue
+            uvp = (out["bary"].unsqueeze(-1) * uvs[faces_l[fid.clamp_min(0)]]).sum(2)  # [H,W,2]
+            cam_fwd = torch.tensor(extrinsics[i], device=device, dtype=torch.float32)[2, :3]
+            facing = (-(face_n[fid.clamp_min(0)] * cam_fwd[None, None, :]).sum(-1)).clamp(min=0.0) ** 2
+            sel = m
+            col = observations[i][sel]            # already /255 float
+            wsel = facing[sel]
+            uvpx = (uvp[sel].clamp(0, 1) * (texture_size - 1)).long()
+            lin = uvpx[:, 1] * texture_size + uvpx[:, 0]
+            tex_sum.index_add_(0, lin, col * wsel[:, None])
+            tex_w.index_add_(0, lin, wsel)
+        cov = tex_w > 0
+        tex = torch.zeros(texture_size * texture_size, 3, device=device)
+        tex[cov] = tex_sum[cov] / tex_w[cov][:, None]
+        texture = (tex.reshape(texture_size, texture_size, 3).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        inpaint_mask = (~cov).reshape(texture_size, texture_size).cpu().numpy().astype(np.uint8)
+        texture = cv2.inpaint(texture, inpaint_mask, 3, cv2.INPAINT_TELEA)
+        # Same trimesh export V-flip compensation as the opt path.
+        texture = np.ascontiguousarray(texture[::-1])
+
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
@@ -588,7 +687,11 @@ def to_glb(
     simplify: float = 0.95,
     fill_holes: bool = True,
     fill_holes_max_size: float = 0.04,
+    fill_holes_resolution: int = 1024,
+    fill_holes_num_views: int = 1000,
     texture_size: int = 1024,
+    lambda_tv: float = 0.01,
+    texture_mode: str = "opt",   # "opt" (Adam) | "average" (smooth angle-weighted) | "fast"
     debug: bool = False,
     verbose: bool = True,
     with_mesh_postprocess=True,
@@ -623,8 +726,8 @@ def to_glb(
             fill_holes=fill_holes,
             fill_holes_max_hole_size=fill_holes_max_size,
             fill_holes_max_hole_nbe=int(250 * np.sqrt(1 - simplify)),
-            fill_holes_resolution=1024,
-            fill_holes_num_views=1000,
+            fill_holes_resolution=fill_holes_resolution,
+            fill_holes_num_views=fill_holes_num_views,
             debug=debug,
             verbose=verbose,
         )
@@ -650,8 +753,8 @@ def to_glb(
             extrinsics,
             intrinsics,
             texture_size=texture_size,
-            mode="opt",
-            lambda_tv=0.01,
+            mode=texture_mode,
+            lambda_tv=lambda_tv,
             verbose=verbose,
             rendering_engine=rendering_engine
         )

@@ -1,154 +1,179 @@
-# SAM 3D
+# SAM 3D Objects — Apple Silicon (macOS / MPS) port
 
-SAM 3D Objects is one part of SAM 3D, a pair of models for object and human mesh reconstruction.  If you’re looking for SAM 3D Body, [click here](https://github.com/facebookresearch/sam-3d-body).
+Run Meta's **[SAM 3D Objects](https://github.com/facebookresearch/sam-3d-objects)**
+image → 3D pipeline on an Apple Silicon Mac. Give it a photo, get back a gaussian
+splat and a **textured `.glb` mesh** — no CUDA, no NVIDIA GPU.
 
-# SAM 3D Objects
+The upstream model is CUDA-only. This fork replaces every CUDA-specific piece
+(spconv, gsplat, nvdiffrast, float64 kernels) with pure-PyTorch / MPS-friendly
+equivalents so the whole thing runs on the Mac's unified-memory GPU. See
+[PORT_LOG.md](PORT_LOG.md) for the full list of changes, and
+[README.upstream.md](README.upstream.md) for Meta's original README.
 
-**SAM 3D Team**, [Xingyu Chen](https://scholar.google.com/citations?user=gjSHr6YAAAAJ&hl=en&oi=sra)\*, [Fu-Jen Chu](https://fujenchu.github.io/)\*, [Pierre Gleize](https://scholar.google.com/citations?user=4imOcw4AAAAJ&hl=en&oi=ao)\*, [Kevin J Liang](https://kevinjliang.github.io/)\*, [Alexander Sax](https://alexsax.github.io/)\*, [Hao Tang](https://scholar.google.com/citations?user=XY6Nh9YAAAAJ&hl=en&oi=sra)\*, [Weiyao Wang](https://sites.google.com/view/weiyaowang/home)\*, [Michelle Guo](https://scholar.google.com/citations?user=lyjjpNMAAAAJ&hl=en&oi=ao), [Thibaut Hardin](https://github.com/Thibaut-H), [Xiang Li](https://ryanxli.github.io/)⚬, [Aohan Lin](https://github.com/linaohan), [Jia-Wei Liu](https://jia-wei-liu.github.io/), [Ziqi Ma](https://ziqi-ma.github.io/)⚬, [Anushka Sagar](https://www.linkedin.com/in/anushkasagar/), [Bowen Song](https://scholar.google.com/citations?user=QQKVkfcAAAAJ&hl=en&oi=sra)⚬, [Xiaodong Wang](https://scholar.google.com/citations?authuser=2&user=rMpcFYgAAAAJ), [Jianing Yang](https://jedyang.com/)⚬, [Bowen Zhang](http://home.ustc.edu.cn/~zhangbowen/)⚬, [Piotr Dollár](https://pdollar.github.io/)†, [Georgia Gkioxari](https://georgiagkioxari.com/)†, [Matt Feiszli](https://scholar.google.com/citations?user=A-wA73gAAAAJ&hl=en&oi=ao)†§, [Jitendra Malik](https://people.eecs.berkeley.edu/~malik/)†§
+> ⚠️ This is an unofficial community port. The model, weights and the
+> **SAM License** ([LICENSE](LICENSE)) belong to Meta. Your use of the weights
+> is governed by that license — this repository only adds macOS glue code.
 
-***Meta Superintelligence Labs***
+---
 
-*Core contributor (Alphabetical, Equal Contribution), ⚬Intern, †Project leads, §Equal Contribution
+## Requirements
 
-[[`Paper`](https://ai.meta.com/research/publications/sam-3d-3dfy-anything-in-images/)] [[`Code`](https://github.com/facebookresearch/sam-3d-objects)] [[`Website`](https://ai.meta.com/sam3d/)] [[`Demo`](https://www.aidemos.meta.com/segment-anything/editor/convert-image-to-3d)] [[`Blog`](https://ai.meta.com/blog/sam-3d/)] [[`BibTeX`](#citing-sam-3d-objects)] [[`Roboflow`](https://blog.roboflow.com/sam-3d/)]
+- **Apple Silicon** Mac (M1/M2/M3/M4). Tested on a Mac with ~24–30 GB unified memory.
+- **macOS** with a recent PyTorch that has MPS enabled.
+- **~12 GB** free disk for the model weights + working memory headroom.
+- Python 3.11.
 
-**SAM 3D Objects** is a foundation model that reconstructs full 3D shape geometry, texture, and layout from a single image, excelling in real-world scenarios with occlusion and clutter by using progressive training and a data engine with human feedback. It outperforms prior 3D generation models in human preference tests on real-world objects and scenes. We released code, weights, online demo, and a new challenging benchmark.
+Memory is the main constraint: the pipeline is memory-heavy and runs **one stage
+at a time** on purpose (see *How it works*). Quit other GPU-hungry apps (browsers,
+Ollama, etc.) before a run — memory pressure is the usual cause of a failed
+(all-NaN) result.
 
+---
 
-<p align="center"><img src="doc/intro.png"/></p>
+## Install
 
------
+```bash
+# 1. Create a Python 3.11 virtual environment next to the repo
+python3.11 -m venv ../s3d_env
+source ../s3d_env/bin/activate
 
-<p align="center"><img src="doc/arch.png"/></p>
+# 2. Install PyTorch (MPS build) + dependencies
+pip install --upgrade pip
+pip install torch torchvision torchaudio          # arm64 / MPS build
+pip install -r requirements.txt
+pip install -e .
 
-## Latest updates
-
-* **06/02/2026** - [3D Artist Object Set](https://ai.meta.com/datasets/sa-3dao-sam-3d-artist-objects/) and [HF Leaderboard](https://huggingface.co/spaces/facebook/sa3dao-leaderboard) are out.
-* **06/01/2026** - Encoder weights are out.
-* **11/19/2025** - Checkpoints Launched, Web Demo and Paper are out.
-
-## Installation
-
-Follow the [setup](doc/setup.md) steps before running the following.
-
-## Single or Multi-Object 3D Generation
-
-SAM 3D Objects can convert masked objects in an image, into 3D models with pose, shape, texture, and layout. SAM 3D is designed to be robust in challenging natural images, handling small objects and occlusions, unusual poses, and difficult situations encountered in uncurated natural scenes like this kidsroom:
-
-<p align="center">
-  <img src="notebook/images/shutterstock_stylish_kidsroom_1640806567/image.png" width="55%"/>
-  <img src="doc/kidsroom_transparent.gif" width="40%"/>
-</p>
-
-For a quick start, run `python demo.py` or use the the following lines of code:
-
-```python
-import sys
-
-# import inference code
-sys.path.append("notebook")
-from inference import Inference, load_image, load_single_mask
-
-# load model
-tag = "hf"
-config_path = f"checkpoints/{tag}/pipeline.yaml"
-inference = Inference(config_path, compile=False)
-
-# load image and mask
-image = load_image("notebook/images/shutterstock_stylish_kidsroom_1640806567/image.png")
-mask = load_single_mask("notebook/images/shutterstock_stylish_kidsroom_1640806567", index=14)
-
-# run model
-output = inference(image, mask, seed=42)
-
-# export gaussian splat
-output["gs"].save_ply(f"splat.ply")
+# 3. rembg (background removal) + trimesh/xatlas etc. are in requirements.txt
 ```
 
-For  more details and multi-object reconstruction, please take a look at out two jupyter notebooks:
-* [single object](notebook/demo_single_object.ipynb)
-* [multi object](notebook/demo_multi_object.ipynb)
+`run.sh` expects the venv at `../s3d_env` (sibling of this repo). If yours lives
+elsewhere, it falls back to whatever `python3` is on your `PATH`.
 
+Key packages: `torch` (MPS), `hydra-core`, `omegaconf`, `trimesh`, `pymeshfix`,
+`xatlas`, `pyvista`, `rembg`, `moge`, `utils3d`, `gradio`.
 
-## SAM 3D Body
+---
 
-[SAM 3D Body (3DB)](https://github.com/facebookresearch/sam-3d-body) is a robust promptable foundation model for single-image 3D human mesh recovery (HMR).
+## Getting the model weights
 
-As a way to combine the strengths of both **SAM 3D Objects** and **SAM 3D Body**, we provide an example notebook that demonstrates how to combine the results of both models such that they are aligned in the same frame of reference. Check it out [here](notebook/demo_3db_mesh_alignment.ipynb).
+The weights (~12 GB) are **not** in this repo. `./run.sh` will detect if they're
+missing and print these steps. Download them once:
 
-## License
+1. **Request access** (one-time) on Hugging Face:
+   <https://huggingface.co/facebook/sam-3d-objects>
 
-The SAM 3D Objects model checkpoints and code are licensed under [SAM License](./LICENSE).
+2. **Authenticate:**
+   ```bash
+   pip install 'huggingface-hub[cli]<1.0'
+   hf auth login          # paste a token from https://hf.co/settings/tokens
+   ```
 
-## Contributing
+3. **Download into the repo:**
+   ```bash
+   mkdir -p checkpoints/hf
+   hf download --repo-type model --max-workers 1 \
+     --local-dir checkpoints/hf-download \
+     facebook/sam-3d-objects
+   mv checkpoints/hf-download/checkpoints checkpoints/hf/checkpoints
+   rm -rf checkpoints/hf-download
+   ```
 
-See [contributing](CONTRIBUTING.md) and the [code of conduct](CODE_OF_CONDUCT.md).
-
-## Contributors
-
-The SAM 3D Objects project was made possible with the help of many contributors.
-
-Robbie Adkins,
-Paris Baptiste,
-Karen Bergan,
-Kai Brown,
-Michelle Chan,
-Ida Cheng,
-Khadijat Durojaiye,
-Patrick Edwards,
-Daniella Factor,
-Facundo Figueroa,
-Rene  de la Fuente,
-Eva Galper,
-Cem Gokmen,
-Alex He,
-Enmanuel Hernandez,
-Dex Honsa,
-Leonna Jones,
-Arpit Kalla,
-Kris Kitani,
-Helen Klein,
-Kei Koyama,
-Robert Kuo,
-Vivian Lee,
-Alex Lende,
-Jonny Li,
-Kehan Lyu,
-Faye Ma,
-Mallika Malhotra,
-Sasha Mitts,
-William Ngan,
-George Orlin,
-Peter Park,
-Don Pinkus,
-Roman Radle,
-Nikhila Ravi,
-Azita Shokrpour,
-Jasmine Shone,
-Zayida Suber,
-Phillip Thomas,
-Tatum Turner,
-Joseph Walker,
-Meng Wang,
-Claudette Ward,
-Andrew Westbury,
-Lea Wilken,
-Nan Yang,
-Yael Yungster
-
-
-## Citing SAM 3D Objects
-
-If you use SAM 3D Objects in your research, please use the following BibTeX entry.
+When done, this directory must exist and hold the `.ckpt` / `.yaml` files:
 
 ```
-@article{sam3dteam2025sam3d3dfyimages,
-      title={SAM 3D: 3Dfy Anything in Images}, 
-      author={SAM 3D Team and Xingyu Chen and Fu-Jen Chu and Pierre Gleize and Kevin J Liang and Alexander Sax and Hao Tang and Weiyao Wang and Michelle Guo and Thibaut Hardin and Xiang Li and Aohan Lin and Jiawei Liu and Ziqi Ma and Anushka Sagar and Bowen Song and Xiaodong Wang and Jianing Yang and Bowen Zhang and Piotr Dollár and Georgia Gkioxari and Matt Feiszli and Jitendra Malik},
-      year={2025},
-      eprint={2511.16624},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2511.16624}, 
-}
+checkpoints/hf/checkpoints/
+├── pipeline.yaml
+├── ss_generator.ckpt        (~6.2 GB)
+├── slat_generator.ckpt      (~4.6 GB)
+├── ss_decoder.ckpt
+├── slat_decoder_gs.ckpt
+├── slat_decoder_mesh.ckpt
+└── … (matching .yaml configs)
 ```
+
+---
+
+## Usage
+
+```bash
+./run.sh
+```
+
+That's the whole thing. It asks two questions and then runs end to end:
+
+1. **Image path** — any ordinary photo. The background is removed automatically
+   (rembg); you do **not** need to pre-extract the object.
+2. **Output folder name** — results are written to `outputs/<name>/`.
+
+Output in `outputs/<name>/`:
+
+| File            | What it is                                    |
+|-----------------|-----------------------------------------------|
+| `extracted.png` | the object with background removed (RGBA)     |
+| `splat.ply`     | the raw gaussian splat                        |
+| `slat.pt`       | the sparse latent (input to the mesh decoder) |
+| `mesh.glb`      | the final **textured mesh**                   |
+
+**Re-bake the mesh only** (skips the expensive splat step) from an existing
+`splat.ply` + `slat.pt`:
+
+```bash
+./run.sh glb outputs/<name>
+```
+
+---
+
+## How it works
+
+The run is split into **two separate OS processes** so that only one
+memory-heavy stage is ever resident — macOS only reclaims a process's GPU memory
+when it exits.
+
+```
+ ┌── Stage 1: cli.py ───────────────┐        ┌── Stage 2: ply2glb.py ───────┐
+ │  photo → rembg mask              │        │  slat.pt → mesh decoder      │
+ │  → sparse-structure diffusion    │  exit  │  → decimate + fill holes     │
+ │  → SLAT diffusion                │ ─────▶ │  → multi-view texture bake   │
+ │  → gaussian splat  (splat.ply)   │ (frees │  → textured mesh.glb         │
+ │  → sparse latent   (slat.pt)     │  mem)  │                              │
+ └──────────────────────────────────┘        └──────────────────────────────┘
+```
+
+Between stages `run.sh` waits until enough memory is free before loading the mesh
+decoder. Generation uses fp16 with a random seed in `0–41` (seed 42 was observed
+to overflow to NaN under memory pressure); an all-NaN result is detected and
+**not** written, so you never get a silently-dead `splat.ply`.
+
+### What was ported from CUDA
+
+- **`gsplat_silicon`** — pure-PyTorch EWA gaussian rasterizer replacing the
+  CUDA-only `gsplat`.
+- **`mesh_raster_silicon`** — tile-based z-buffered triangle rasterizer replacing
+  `nvdiffrast` for face-id / UV rasterization and hole filling.
+- **native sparse conv** — pure-PyTorch drop-in for `spconv`.
+- **float64 on CPU** — MPS has no float64; camera math and splat sort keys are
+  computed on CPU and moved back to the device.
+- **fp32 mesh decoder** — the mesh decoder's attention overflows in fp16 on MPS,
+  so it is forced to fp32.
+
+---
+
+## Troubleshooting
+
+- **`MODEL WEIGHTS NOT FOUND`** — download the weights (see above).
+- **Output is NaN / crash mid-run** — memory pressure. Quit other GPU apps and
+  re-run; each run is a fresh process, so retries start clean.
+- **`Abort trap: 6` / MTLBuffer allocation failure** — not enough free memory for
+  the model. Close apps and don't run two heavy jobs at once.
+
+---
+
+## Credits & License
+
+- Original model, research and weights: **Meta / SAM 3D Team** —
+  [facebookresearch/sam-3d-objects](https://github.com/facebookresearch/sam-3d-objects).
+- Apple Silicon port: this repository.
+
+Use of the model and weights is subject to Meta's **SAM License** — see
+[LICENSE](LICENSE). This port is provided as-is for research/personal use under
+those same terms.

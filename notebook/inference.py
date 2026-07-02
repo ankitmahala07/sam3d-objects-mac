@@ -104,6 +104,11 @@ class Inference:
             config.dtype = "float16"
             if hasattr(config, "shape_model_dtype") and config.shape_model_dtype is None:
                 config.shape_model_dtype = "float16"
+            if hasattr(config, "depth_model"):
+                config.depth_model.device = "mps"
+            # Gaussian-only on MPS to skip loading the mesh decoder (~7 GB) and avoid OOM
+            config.decode_formats = ["gaussian"]
+            config.rendering_engine = "pytorch3d"
         check_hydra_safety(config, WHITELIST_FILTERS, BLACKLIST_FILTERS)
         self._pipeline: InferencePipelinePointMap = instantiate(config)
 
@@ -122,15 +127,17 @@ class Inference:
         pointmap=None,
     ) -> dict:
         image = self.merge_mask_to_rgba(image, mask)
+        import torch as _t
+        use_tex = _t.backends.mps.is_available() or _t.cuda.is_available()
         return self._pipeline.run(
             image,
             None,
             seed,
             stage1_only=False,
             with_mesh_postprocess=False,
-            with_texture_baking=False,
+            with_texture_baking=use_tex,
             with_layout_postprocess=False,
-            use_vertex_color=True,
+            use_vertex_color=not use_tex,
             stage1_inference_steps=None,
             pointmap=pointmap,
         )

@@ -57,7 +57,7 @@ class Gaussian:
 
         self.rotation_activation = torch.nn.functional.normalize
 
-        _dev = torch.device(device) if isinstance(device, str) else device
+        _dev = torch.device(self.device) if isinstance(self.device, str) else self.device
         self.scale_bias = self.inverse_scaling_activation(
             torch.tensor(self.scaling_bias)
         ).to(_dev)

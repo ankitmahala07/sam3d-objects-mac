@@ -194,6 +194,24 @@ def load_model_from_checkpoint(
     if state_dict_fn is not None:
         state_dict = state_dict_fn(state_dict)
 
+    # Remap checkpoint keys where conv layers have an extra `.conv` wrapper
+    # e.g. "conv1.conv.weight" -> "conv1.weight" for compatibility with current model.
+    # Also transpose conv weights from [out, D, H, W, in] -> [D, H, W, in, out].
+    import re as _re
+    import torch as _torch
+    remapped = {}
+    for k, v in list(state_dict.items()):
+        new_k = _re.sub(r'\.(conv\d+)\.conv\.', r'.\1.', k)
+        # Strip `.conv.` wrapper in upsample out_layers/skip_connection paths only
+        # e.g. "upsample.0.out_layers.0.conv.weight" -> "upsample.0.out_layers.0.weight"
+        new_k = _re.sub(r'\.(out_layers\.\d+|skip_connection)\.conv\.(weight|bias)$', r'.\1.\2', new_k)
+        if new_k != k:
+            if new_k.endswith('.weight') and v.ndim == 5:
+                v = v.permute(1, 2, 3, 4, 0).contiguous()
+            remapped[new_k] = v
+            del state_dict[k]
+    state_dict.update(remapped)
+
     model.load_state_dict(state_dict, strict=strict)
 
     if device is not None:

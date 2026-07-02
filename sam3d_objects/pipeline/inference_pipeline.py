@@ -154,9 +154,12 @@ class InferencePipeline:
             slat_decoder_gs_4 = self.init_slat_decoder_gs(
                 slat_decoder_gs_4_config_path, slat_decoder_gs_4_ckpt_path
             )
-            slat_decoder_mesh = self.init_slat_decoder_mesh(
-                slat_decoder_mesh_config_path, slat_decoder_mesh_ckpt_path
-            )
+            if "mesh" in decode_formats:
+                slat_decoder_mesh = self.init_slat_decoder_mesh(
+                    slat_decoder_mesh_config_path, slat_decoder_mesh_ckpt_path
+                )
+            else:
+                slat_decoder_mesh = None
 
             # Load conditioner embedder so that we only load it once
             ss_condition_embedder = self.init_ss_condition_embedder(
@@ -386,10 +389,13 @@ class InferencePipeline:
     def init_slat_decoder_mesh(
         self, slat_decoder_mesh_config_path, slat_decoder_mesh_ckpt_path
     ):
+        cfg = OmegaConf.load(
+            os.path.join(self.workspace_dir, slat_decoder_mesh_config_path)
+        )
+        # Inject device so FlexiCubes / SparseFeatures2Mesh use MPS instead of "cuda"
+        cfg.device = str(self.device)
         return self.instantiate_and_load_from_pretrained(
-            OmegaConf.load(
-                os.path.join(self.workspace_dir, slat_decoder_mesh_config_path)
-            ),
+            cfg,
             os.path.join(self.workspace_dir, slat_decoder_mesh_ckpt_path),
             device=self.device,
             state_dict_key=None,
