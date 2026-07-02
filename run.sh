@@ -101,14 +101,23 @@ wait_for_memory() {
     done
 }
 
-check_models
-
 # --- glb: re-convert an existing splat -----------------------------------------
 if [[ "$1" == "glb" ]]; then
+    check_models
     exec "$PY" "$SCRIPT_DIR/ply2glb.py" "${2:-}"
 fi
 
-# --- full flow (default): cli -> free memory -> glb ----------------------------
+# Only "", "full" run the full flow; anything else is a mistake — show usage.
+if [[ -n "$1" && "$1" != "full" ]]; then
+    echo "Usage:"
+    echo "  ./run.sh [full]     image -> gaussian splat -> textured GLB"
+    echo "  ./run.sh glb <dir>  re-convert one output dir's splat.ply -> mesh.glb"
+    exit 1
+fi
+
+check_models
+
+# --- full flow (default / 'full'): cli -> free memory -> glb -------------------
 MANIFEST="$(mktemp /tmp/sam3d_manifest.XXXXXX)"
 : > "$MANIFEST"
 
