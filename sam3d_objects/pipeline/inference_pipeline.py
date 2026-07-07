@@ -126,8 +126,18 @@ class InferencePipeline:
             if shape_model_dtype is None:
                 self.shape_model_dtype = self.dtype
             else:
-                self.shape_model_dtype = self._get_dtype(shape_model_dtype) 
+                self.shape_model_dtype = self._get_dtype(shape_model_dtype)
 
+            # On Apple Silicon (MPS) unified memory is the hard limit, so keep the
+            # big backbones stored in fp16 instead of fp32 — they run under fp16
+            # autocast anyway. CUDA behaviour is left unchanged (store_dtype=None).
+            self._store_dtype = (
+                self.dtype
+                if (torch.backends.mps.is_available()
+                    and not torch.cuda.is_available()
+                    and self.dtype == torch.float16)
+                else None
+            )
 
             # Setup preprocessors
             self.pose_decoder = self.init_pose_decoder(ss_generator_config_path, pose_decoder_name)
@@ -274,6 +284,7 @@ class InferencePipeline:
         state_dict_fn=None,
         state_dict_key="state_dict",
         device="cpu",  # load to CPU first, then move to target device
+        store_dtype=None,  # if set, keep the weights in this dtype (halves RAM in fp16)
     ):
         model = instantiate(config)
 
@@ -294,6 +305,11 @@ class InferencePipeline:
                 state_dict_key=state_dict_key,
                 state_dict_fn=state_dict_fn,
             )
+        # Weights load as fp32. The pipeline runs these under fp16 autocast anyway,
+        # so on memory-tight devices (MPS) we store them in fp16 to roughly halve
+        # resident RAM — the fp32 "master" copy buys nothing at inference time.
+        if store_dtype is not None:
+            model = model.to(dtype=store_dtype)
         model = model.to(device)
 
         return model
@@ -324,6 +340,7 @@ class InferencePipeline:
             os.path.join(self.workspace_dir, ss_generator_ckpt_path),
             state_dict_fn=state_dict_prefix_func,
             device=self.device,
+            store_dtype=self._store_dtype,
         )
 
     def init_slat_generator(self, slat_generator_config_path, slat_generator_ckpt_path):
@@ -338,6 +355,7 @@ class InferencePipeline:
             os.path.join(self.workspace_dir, slat_generator_ckpt_path),
             state_dict_fn=state_dict_prefix_func,
             device=self.device,
+            store_dtype=self._store_dtype,
         )
 
     def init_ss_encoder(self, ss_encoder_config_path, ss_encoder_ckpt_path):
@@ -415,6 +433,7 @@ class InferencePipeline:
                     "_base_models.condition_embedder."
                 ),
                 device=self.device,
+                store_dtype=self._store_dtype,
             )
         else:
             return None

@@ -386,12 +386,34 @@ class InferencePipelinePointMap(InferencePipeline):
             "optim_accepted": flag_optim,
         }
 
+    def _free_modules(self, model_keys=(), embedder_keys=(), drop_depth=False):
+        """Permanently free models we won't use again this run, to lower peak
+        memory. Only safe for a single-shot run (the pipeline can't run again
+        afterwards) — used by the CLI, which processes one object then exits.
+        On unified-memory Macs this physically returns RAM before the next
+        stage's activations allocate."""
+        import gc
+        for k in model_keys:
+            if k in self.models:
+                del self.models[k]
+        for k in embedder_keys:
+            if self.condition_embedders.get(k) is not None:
+                self.condition_embedders[k] = None
+        if drop_depth:
+            self.depth_model = None
+        gc.collect()
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        elif torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def run(
         self,
         image: Union[None, Image.Image, np.ndarray],
         mask: Union[None, Image.Image, np.ndarray] = None,
         seed: Optional[int] = None,
         stage1_only=False,
+        free_stage_models=False,
         with_mesh_postprocess=True,
         with_texture_baking=True,
         with_layout_postprocess=False,
@@ -419,6 +441,9 @@ class InferencePipelinePointMap(InferencePipeline):
             )
 
             slat_input_dict = self.preprocess_image(image, self.slat_preprocessor)
+            # MoGe depth model is only used by compute_pointmap above.
+            if free_stage_models and not estimate_plane:
+                self._free_modules(drop_depth=True)
             if seed is not None:
                 torch.manual_seed(seed)
             ss_return_dict = self.sample_sparse_structure(
@@ -452,12 +477,25 @@ class InferencePipelinePointMap(InferencePipeline):
                 # return ss_return_dict
 
             coords = ss_return_dict["coords"]
+            # Stage 1 is done (sparse structure + pose). Free its models before
+            # SLAT allocates — the biggest single memory win on 24 GB Macs.
+            if free_stage_models:
+                self._free_modules(
+                    model_keys=("ss_generator", "ss_decoder", "ss_encoder"),
+                    embedder_keys=("ss_condition_embedder",),
+                )
             slat = self.sample_slat(
                 slat_input_dict,
                 coords,
                 inference_steps=stage2_inference_steps,
                 use_distillation=use_stage2_distillation,
             )
+            # SLAT sampling is done; only the decoder is needed to decode it.
+            if free_stage_models:
+                self._free_modules(
+                    model_keys=("slat_generator",),
+                    embedder_keys=("slat_condition_embedder",),
+                )
             outputs = self.decode_slat(
                 slat, self.decode_formats if decode_formats is None else decode_formats
             )

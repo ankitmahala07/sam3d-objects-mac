@@ -146,6 +146,13 @@ slower:
 The difference in the final mesh is minor; the main cost of higher steps is time
 (and memory). Low is the recommended setting for almost everyone.
 
+**Low-memory mode (automatic on MPS).** The splat step keeps the big diffusion
+backbones in fp16 (instead of fp32, ~halving their RAM) and frees each stage's
+models as soon as it's done — the depth model before Stage 1, the
+sparse-structure model before Stage 2, the SLAT model before decoding. This
+lowers the peak enough to run on smaller Macs; still use **Low (10 steps)** on
+24 GB and close other apps first.
+
 ---
 
 ## How it works

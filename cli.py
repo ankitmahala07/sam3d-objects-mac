@@ -152,6 +152,10 @@ def run_pipeline(img_rgb, mask, obj_dir, steps):
     # in-process — the prior attempt's ~15 GB stays allocated and a second run hits a
     # hard Metal allocation crash. Retry by re-running as a fresh process.
     step(f"Running  (steps={steps}  seed={seed})…")
+    import gc
+    gc.collect()
+    if _t.backends.mps.is_available():
+        _t.mps.empty_cache()
     t0 = time.time()
     output = pipeline._pipeline.run(
         PILImage.fromarray(rgba),
@@ -159,6 +163,10 @@ def run_pipeline(img_rgb, mask, obj_dir, steps):
         stage1_inference_steps=steps,
         stage2_inference_steps=steps,
         decode_formats=["gaussian"],   # skip mesh decoder entirely (ply2glb does it)
+        # Single-shot run: free each stage's models before the next stage
+        # allocates. Frees ~6 GB (ss_generator) + MoGe before SLAT — the key to
+        # not exhausting unified memory on 24 GB Macs.
+        free_stage_models=True,
         with_mesh_postprocess=False,
         with_texture_baking=False,
         use_vertex_color=False,
