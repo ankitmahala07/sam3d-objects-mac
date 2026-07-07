@@ -421,15 +421,19 @@ class ShortCut(FlowMatching):
         """Generate samples using shortcut model"""
         x_0 = self._generate_noise(x_shape, x_device)
         t_seq, d = self._prepare_t_and_d()
+        progress_callback = getattr(self, "progress_callback", None)
+        total_steps = max(0, len(t_seq) - 1)
 
-        for x_t, t in self._solver.solve_iter(
+        for step_idx, (x_t, t) in enumerate(self._solver.solve_iter(
             self._generate_dynamics,
             x_0,
             t_seq,
             d,
             *args_conditionals,
             **kwargs_conditionals,
-        ):
+        ), start=1):
+            if progress_callback is not None:
+                progress_callback(step_idx, total_steps)
             yield t, x_t, ()
 
     def _generate_dynamics(

@@ -1,4 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+import os
 import torch
 import numpy as np
 from plyfile import PlyData, PlyElement
@@ -122,6 +123,27 @@ class Gaussian:
     def from_opacity(self, opacities):
         self._opacity = self.inverse_opacity_activation(opacities) - self.opacity_bias
 
+    def to(self, device=None, dtype=None):
+        tensor_names = (
+            "aabb",
+            "scale_bias",
+            "rots_bias",
+            "opacity_bias",
+            "_xyz",
+            "_features_dc",
+            "_features_rest",
+            "_scaling",
+            "_rotation",
+            "_opacity",
+        )
+        for name in tensor_names:
+            value = getattr(self, name, None)
+            if isinstance(value, torch.Tensor):
+                setattr(self, name, value.to(device=device, dtype=dtype))
+        if device is not None:
+            self.device = torch.device(device)
+        return self
+
     def construct_list_of_attributes(self):
         l = ["x", "y", "z", "nx", "ny", "nz"]
         # All channels except the 3 DC
@@ -135,31 +157,73 @@ class Gaussian:
         return l
 
     def save_ply(self, path):
-        xyz = self.get_xyz.detach().cpu().numpy()
-        normals = np.zeros_like(xyz)
+        # Materialize save attributes in fp32. Some valid fp16 decoder values can
+        # overflow in exp/log on MPS during serialization even though fp32 is fine.
+        xyz = (
+            self._xyz.detach().float() * self.aabb.detach().float()[None, 3:]
+            + self.aabb.detach().float()[None, :3]
+        ).cpu().numpy()
         f_dc = (
             self._features_dc.detach()
+            .float()
             .transpose(1, 2)
             .flatten(start_dim=1)
             .contiguous()
             .cpu()
             .numpy()
         )
-        opacities = inverse_sigmoid(self.get_opacity).detach().cpu().numpy()
-        scale = torch.log(self.get_scaling).detach().cpu().numpy()
-        rotation = (self._rotation + self.rots_bias[None, :]).detach().cpu().numpy()
+        opacities = (
+            self._opacity.detach().float() + self.opacity_bias.detach().float()
+        ).cpu().numpy()
+        scaling = self.scaling_activation(
+            self._scaling.detach().float() + self.scale_bias.detach().float()
+        )
+        scaling = torch.square(scaling) + self.mininum_kernel_size**2
+        scale = torch.log(torch.sqrt(scaling)).cpu().numpy()
+        rotation = (
+            self._rotation.detach().float() + self.rots_bias.detach().float()[None, :]
+        ).cpu().numpy()
+
+        for name, array in (
+            ("xyz", xyz),
+            ("features", f_dc),
+            ("opacity", opacities),
+            ("scale", scale),
+            ("rotation", rotation),
+        ):
+            finite = np.isfinite(array)
+            if not finite.all():
+                bad = array.size - int(finite.sum())
+                raise ValueError(
+                    f"Gaussian contains {bad} non-finite {name} value(s); refusing to write PLY"
+                )
 
         dtype_full = [
             (attribute, "f4") for attribute in self.construct_list_of_attributes()
         ]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate(
-            (xyz, normals, f_dc, opacities, scale, rotation), axis=1
-        )
-        elements[:] = list(map(tuple, attributes))
+        elements["x"] = xyz[:, 0]
+        elements["y"] = xyz[:, 1]
+        elements["z"] = xyz[:, 2]
+        elements["nx"] = 0.0
+        elements["ny"] = 0.0
+        elements["nz"] = 0.0
+        for i in range(f_dc.shape[1]):
+            elements[f"f_dc_{i}"] = f_dc[:, i]
+        elements["opacity"] = opacities[:, 0]
+        for i in range(scale.shape[1]):
+            elements[f"scale_{i}"] = scale[:, i]
+        for i in range(rotation.shape[1]):
+            elements[f"rot_{i}"] = rotation[:, i]
         el = PlyElement.describe(elements, "vertex")
-        PlyData([el]).write(path)
+        tmp_path = f"{path}.tmp"
+        try:
+            PlyData([el]).write(tmp_path)
+            os.replace(tmp_path, path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
     def load_ply(self, path):
         plydata = PlyData.read(path)

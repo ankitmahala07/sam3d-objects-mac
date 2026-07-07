@@ -1,5 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 from typing import *
+import os
 import torch
 import math
 from . import DEBUG, BACKEND
@@ -36,6 +37,32 @@ def _naive_sdpa(q, k, v):
     out = attn_weight @ v
     out = out.permute(0, 2, 1, 3)  # [N, L, H, C]
     return out
+
+
+def _mps_chunk_size():
+    raw = os.environ.get("SAM3D_MPS_ATTN_CHUNK", "128")
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 128
+
+
+def _mps_should_chunk(q):
+    return q.device.type == "mps" and os.environ.get("SAM3D_MPS_USE_SDPA", "0") != "1"
+
+
+def _chunked_sdpa_bhlc(q, k, v, chunk_size=None):
+    """Scaled dot-product attention for [B, H, L, C] tensors without MPS SDPA."""
+    chunk_size = _mps_chunk_size() if chunk_size is None else chunk_size
+    scale_factor = 1 / math.sqrt(q.size(-1))
+    k_t = k.transpose(-2, -1).contiguous()
+    out_chunks = []
+    for start in range(0, q.shape[-2], chunk_size):
+        q_chunk = q[..., start : start + chunk_size, :]
+        attn = torch.matmul(q_chunk, k_t) * scale_factor
+        attn = torch.softmax(attn.float(), dim=-1).to(v.dtype)
+        out_chunks.append(torch.matmul(attn, v))
+    return torch.cat(out_chunks, dim=-2)
 
 
 @overload
@@ -148,7 +175,10 @@ def scaled_dot_product_attention(*args, **kwargs):
         q = q.permute(0, 2, 1, 3)  # [N, H, L, C]
         k = k.permute(0, 2, 1, 3)  # [N, H, L, C]
         v = v.permute(0, 2, 1, 3)  # [N, H, L, C]
-        out = sdpa(q, k, v)  # [N, H, L, C]
+        if _mps_should_chunk(q):
+            out = _chunked_sdpa_bhlc(q, k, v)  # [N, H, L, C]
+        else:
+            out = sdpa(q, k, v)  # [N, H, L, C]
         out = out.permute(0, 2, 1, 3)  # [N, L, H, C]
     elif BACKEND == "torch_flash_attn":
         if num_all_args == 1:
@@ -170,7 +200,13 @@ def scaled_dot_product_attention(*args, **kwargs):
             q, k, v = qkv.unbind(dim=2)
         elif num_all_args == 2:
             k, v = kv.unbind(dim=2)
-        out = _naive_sdpa(q, k, v)
+        if _mps_should_chunk(q):
+            q = q.permute(0, 2, 1, 3)
+            k = k.permute(0, 2, 1, 3)
+            v = v.permute(0, 2, 1, 3)
+            out = _chunked_sdpa_bhlc(q, k, v).permute(0, 2, 1, 3)
+        else:
+            out = _naive_sdpa(q, k, v)
     else:
         raise ValueError(f"Unknown attention module: {BACKEND}")
 

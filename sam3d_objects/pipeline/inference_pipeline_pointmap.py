@@ -407,6 +407,24 @@ class InferencePipelinePointMap(InferencePipeline):
         elif torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    def _assert_finite_tensor(self, tensor, label):
+        if tensor is None or not torch.is_floating_point(tensor):
+            return
+        if not bool(torch.isfinite(tensor).all().detach().cpu().item()):
+            raise FloatingPointError(f"{label} contains NaN/Inf; aborting before PLY generation")
+
+    def _assert_finite_gaussian(self, gs, label="gaussian"):
+        for name in ("_xyz", "_features_dc", "_scaling", "_rotation", "_opacity"):
+            self._assert_finite_tensor(getattr(gs, name, None), f"{label}.{name}")
+
+    def _sparse_to_cpu(self, slat):
+        return type(slat)(
+            feats=slat.feats.detach().cpu(),
+            coords=slat.coords.detach().cpu(),
+            shape=slat.shape,
+            layout=slat.layout,
+        )
+
     def run(
         self,
         image: Union[None, Image.Image, np.ndarray],
@@ -425,31 +443,63 @@ class InferencePipelinePointMap(InferencePipeline):
         pointmap=None,
         decode_formats=None,
         estimate_plane=False,
+        fail_on_nan=False,
+        return_pointmap=True,
+        return_latents=True,
+        progress_callback=None,
     ) -> dict:
+        def emit_progress(event, **payload):
+            if progress_callback is not None:
+                progress_callback(event, **payload)
+
+        def stage_progress(label):
+            if progress_callback is None:
+                return None
+
+            def _callback(current, total):
+                emit_progress(
+                    "diffusion",
+                    label=label,
+                    current=current,
+                    total=total,
+                )
+
+            return _callback
+
         image = self.merge_image_and_mask(image, mask)
         with self.device: 
+            emit_progress("phase", label="Depth pointmap")
             pointmap_dict = self.compute_pointmap(image, pointmap)
             pointmap = pointmap_dict["pointmap"]
-            pts = type(self)._down_sample_img(pointmap)
-            pts_colors = type(self)._down_sample_img(pointmap_dict["pts_color"])
 
             if estimate_plane:
                 return self.estimate_plane(pointmap_dict, image)
 
+            pts = pts_colors = None
+            if return_pointmap:
+                pts = type(self)._down_sample_img(pointmap).cpu().permute((1, 2, 0))
+                pts_colors = (
+                    type(self)
+                    ._down_sample_img(pointmap_dict["pts_color"])
+                    .cpu()
+                    .permute((1, 2, 0))
+                )
+
             ss_input_dict = self.preprocess_image(
                 image, self.ss_preprocessor, pointmap=pointmap
             )
-
-            slat_input_dict = self.preprocess_image(image, self.slat_preprocessor)
+            emit_progress("advance", label="Depth + image prep", amount=1)
             # MoGe depth model is only used by compute_pointmap above.
             if free_stage_models and not estimate_plane:
                 self._free_modules(drop_depth=True)
             if seed is not None:
                 torch.manual_seed(seed)
+            emit_progress("phase", label="Stage 1 sparse diffusion")
             ss_return_dict = self.sample_sparse_structure(
                 ss_input_dict,
                 inference_steps=stage1_inference_steps,
                 use_distillation=use_stage1_distillation,
+                progress_callback=stage_progress("Stage 1 sparse"),
             )
 
             # We could probably use the decoder from the models themselves
@@ -465,18 +515,26 @@ class InferencePipelinePointMap(InferencePipeline):
 
             logger.info(f"Rescaling scale by {ss_return_dict['downsample_factor']} after downsampling")
             ss_return_dict["scale"] = ss_return_dict["scale"] * ss_return_dict["downsample_factor"]
+            emit_progress("advance", label="Pose + downsample", amount=1)
 
             if stage1_only:
                 logger.info("Finished!")
                 ss_return_dict["voxel"] = ss_return_dict["coords"][:, 1:] / 64 - 0.5
-                return {
-                    **ss_return_dict,
-                    "pointmap": pts.cpu().permute((1, 2, 0)),  # HxWx3
-                    "pointmap_colors": pts_colors.cpu().permute((1, 2, 0)),  # HxWx3
-                }
+                ret = {**ss_return_dict}
+                if return_pointmap:
+                    ret.update({"pointmap": pts, "pointmap_colors": pts_colors})
+                return ret
                 # return ss_return_dict
 
+            if not return_latents:
+                ss_return_dict.pop("shape", None)
+                ss_return_dict.pop("coords_original", None)
+
             coords = ss_return_dict["coords"]
+            if not with_layout_postprocess:
+                del ss_input_dict
+                pointmap_dict = None
+                pointmap = None
             # Stage 1 is done (sparse structure + pose). Free its models before
             # SLAT allocates — the biggest single memory win on 24 GB Macs.
             if free_stage_models:
@@ -484,24 +542,49 @@ class InferencePipelinePointMap(InferencePipeline):
                     model_keys=("ss_generator", "ss_decoder", "ss_encoder"),
                     embedder_keys=("ss_condition_embedder",),
                 )
+            emit_progress("phase", label="Stage 2 setup")
+            slat_input_dict = self.preprocess_image(image, self.slat_preprocessor)
+            emit_progress("advance", label="Stage 2 setup", amount=1)
+            emit_progress("phase", label="Stage 2 latent diffusion")
             slat = self.sample_slat(
                 slat_input_dict,
                 coords,
                 inference_steps=stage2_inference_steps,
                 use_distillation=use_stage2_distillation,
+                progress_callback=stage_progress("Stage 2 latent"),
             )
+            if fail_on_nan:
+                self._assert_finite_tensor(slat.feats, "structured latent")
             # SLAT sampling is done; only the decoder is needed to decode it.
             if free_stage_models:
                 self._free_modules(
                     model_keys=("slat_generator",),
                     embedder_keys=("slat_condition_embedder",),
                 )
+            emit_progress("phase", label="Decode gaussian")
             outputs = self.decode_slat(
                 slat, self.decode_formats if decode_formats is None else decode_formats
             )
+            if fail_on_nan:
+                for idx, gs in enumerate(outputs.get("gaussian", ())):
+                    self._assert_finite_gaussian(gs, f"gaussian[{idx}]")
             outputs = self.postprocess_slat_output(
                 outputs, with_mesh_postprocess, with_texture_baking, use_vertex_color
             )
+            if free_stage_models and not with_layout_postprocess:
+                del slat_input_dict
+                del coords
+                slat = self._sparse_to_cpu(slat)
+                for key in ("gaussian", "gaussian_4"):
+                    for gs in outputs.get(key, ()) or ():
+                        gs.to("cpu")
+                for key, value in list(ss_return_dict.items()):
+                    if isinstance(value, torch.Tensor):
+                        ss_return_dict[key] = value.detach().cpu()
+                self._free_modules(
+                    model_keys=("slat_decoder_gs", "slat_decoder_gs_4", "slat_decoder_mesh")
+                )
+            emit_progress("advance", label="Decode gaussian", amount=1)
             glb = outputs.get("glb", None)
             gs_input = outputs.get("gaussian", None)
 
@@ -543,13 +626,14 @@ class InferencePipelinePointMap(InferencePipeline):
 
             logger.info("Finished!")
 
-            return {
+            ret = {
                 **ss_return_dict,
                 **outputs,
                 "slat": slat,
-                "pointmap": pts.cpu().permute((1, 2, 0)),  # HxWx3
-                "pointmap_colors": pts_colors.cpu().permute((1, 2, 0)),  # HxWx3
             }
+            if return_pointmap:
+                ret.update({"pointmap": pts, "pointmap_colors": pts_colors})
+            return ret
 
     @staticmethod
     def _down_sample_img(img_3chw: torch.Tensor):

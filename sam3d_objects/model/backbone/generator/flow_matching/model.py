@@ -208,14 +208,18 @@ class FlowMatching(Base):
     ):
         x_0 = self._generate_noise(x_shape, x_device)
         t_seq = self._prepare_t().to(x_device)
+        progress_callback = getattr(self, "progress_callback", None)
+        total_steps = max(0, len(t_seq) - 1)
 
-        for x_t, t in self._solver.solve_iter(
+        for step_idx, (x_t, t) in enumerate(self._solver.solve_iter(
             self._generate_dynamics,
             x_0,
             t_seq,
             *args_conditionals,
             **kwargs_conditionals,
-        ):
+        ), start=1):
+            if progress_callback is not None:
+                progress_callback(step_idx, total_steps)
             yield t, x_t, ()
 
     def _generate_dynamics(
@@ -337,6 +341,8 @@ class ConditionalFlowMatching(FlowMatching):
     ):
         x_0 = self._generate_noise(x_shape, x_device)
         t_seq = self._prepare_t().to(x_device)
+        progress_callback = getattr(self, "progress_callback", None)
+        total_steps = max(0, len(t_seq) - 1)
 
         noise_override = None
         if "noise_override" in kwargs_conditionals:
@@ -348,13 +354,15 @@ class ConditionalFlowMatching(FlowMatching):
                 else:
                     x_0 = noise_override
 
-        for x_t, t in self._solver.solve_iter(
+        for step_idx, (x_t, t) in enumerate(self._solver.solve_iter(
             self._generate_dynamics,
             x_0,
             t_seq,
             *args_conditionals,
             **kwargs_conditionals,
-        ):
+        ), start=1):
+            if progress_callback is not None:
+                progress_callback(step_idx, total_steps)
             if noise_override is not None:
                 if type(noise_override) == dict:
                     x_t.update(noise_override)

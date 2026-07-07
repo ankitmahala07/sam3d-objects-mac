@@ -12,7 +12,7 @@ elif ATTN == "flash_attn":
     import flash_attn
 elif ATTN == "sdpa":
     from torch.nn.functional import scaled_dot_product_attention as sdpa
-    from .masked_sdpa import masked_sdpa
+    from .masked_sdpa import chunked_sdpa_bhlc, masked_sdpa, mps_should_chunk
 else:
     raise ValueError(f"Unknown attention module: {ATTN}")
 
@@ -221,7 +221,10 @@ def sparse_serialized_scaled_dot_product_self_attention(
             q = q.permute(0, 2, 1, 3)  # [N, H, L, C]
             k = k.permute(0, 2, 1, 3)  # [N, H, L, C]
             v = v.permute(0, 2, 1, 3)  # [N, H, L, C]
-            out = sdpa(q, k, v)  # [N, H, L, C]
+            if mps_should_chunk(q):
+                out = chunked_sdpa_bhlc(q, k, v)  # [N, H, L, C]
+            else:
+                out = sdpa(q, k, v)  # [N, H, L, C]
             out = out.permute(0, 2, 1, 3)  # [N, L, H, C]
         else:
             raise ValueError(f"Unknown attention module: {ATTN}")

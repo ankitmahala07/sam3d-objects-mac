@@ -91,12 +91,18 @@ BLACKLIST_FILTERS = [
 class Inference:
     # public facing inference API
     # only put publicly exposed arguments here
-    def __init__(self, config_file: str, compile: bool = False):
+    def __init__(
+        self,
+        config_file: str,
+        compile: bool = False,
+        low_memory_single_shot: bool = False,
+    ):
         # load inference pipeline
         config = OmegaConf.load(config_file)
         config.rendering_engine = "pytorch3d"  # overwrite to disable nvdiffrast
         config.compile_model = compile
         config.workspace_dir = os.path.dirname(config_file)
+        config.lazy_load_models = low_memory_single_shot
         # Apple Silicon: use MPS with float16 (bfloat16 is unreliable on MPS)
         import torch as _torch
         if _torch.backends.mps.is_available() and not _torch.cuda.is_available():

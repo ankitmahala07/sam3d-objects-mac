@@ -36,6 +36,82 @@ def ok(msg):    print(f"  {G}✓{RST}  {msg}", flush=True)
 def warn(msg):  print(f"  {Y}⚠{RST}   {msg}")
 def err(msg):   print(f"  {R}✗{RST}   {msg}")
 
+
+class CliProgress:
+    def __init__(self, total, width=34):
+        self.total = max(1, int(total))
+        self.width = width
+        self.done = 0
+        self.label = "Starting"
+        self.started = time.time()
+        self.live = sys.stdout.isatty()
+        self._rendered = False
+        self._last_render = 0.0
+        self._stage_steps = {}
+
+    def __call__(self, event, **payload):
+        if event == "phase":
+            self.label = payload.get("label", self.label)
+            self._render(force=True)
+            return
+
+        if event == "advance":
+            self.label = payload.get("label", self.label)
+            self._add(payload.get("amount", 1))
+            self._render(force=True)
+            return
+
+        if event == "diffusion":
+            label = payload.get("label", "Diffusion")
+            current = int(payload.get("current", 0))
+            total = max(1, int(payload.get("total", 1)))
+            previous = self._stage_steps.get(label, 0)
+            self._stage_steps[label] = current
+            self.label = f"{label} {current}/{total}"
+            self._add(max(0, current - previous))
+            self._render()
+
+    def advance(self, label, amount=1):
+        self("advance", label=label, amount=amount)
+
+    def finish(self, label="Complete"):
+        self.done = self.total
+        self.label = label
+        self._render(force=True)
+        self.close()
+
+    def close(self):
+        if self.live and self._rendered:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        self._rendered = False
+
+    def _add(self, amount):
+        self.done = min(self.total, self.done + int(amount))
+
+    def _render(self, force=False):
+        now = time.time()
+        if not force and now - self._last_render < 0.15 and self.done < self.total:
+            return
+        self._last_render = now
+
+        pct = self.done / self.total
+        filled = min(self.width, int(round(self.width * pct)))
+        bar = "#" * filled + "-" * (self.width - filled)
+        elapsed = int(now - self.started)
+        text = (
+            f"  {C}›{RST}  [{bar}] {pct * 100:5.1f}%  "
+            f"{self.done}/{self.total}  {self.label}  {elapsed}s"
+        )
+
+        if self.live:
+            sys.stdout.write("\r" + text + "\033[K")
+            sys.stdout.flush()
+            self._rendered = True
+        elif force:
+            print(text, flush=True)
+
+
 def ask(prompt, default=None):
     suffix = f" [{default}]" if default is not None else ""
     try:
@@ -135,7 +211,7 @@ def run_pipeline(img_rgb, mask, obj_dir, steps):
     step("Loading pipeline…  (may take ~30s on first run)")
     CONFIG = os.path.join(ROOT, "checkpoints", "hf", "checkpoints", "pipeline.yaml")
     from inference import Inference
-    pipeline = Inference(CONFIG, compile=False)
+    pipeline = Inference(CONFIG, compile=False, low_memory_single_shot=True)
     ok("Pipeline ready")
 
     seed = random.randint(0, 41)   # capped 0-41: 42 was observed to overflow fp16
@@ -157,41 +233,77 @@ def run_pipeline(img_rgb, mask, obj_dir, steps):
     if _t.backends.mps.is_available():
         _t.mps.empty_cache()
     t0 = time.time()
-    output = pipeline._pipeline.run(
-        PILImage.fromarray(rgba),
-        seed=seed,
-        stage1_inference_steps=steps,
-        stage2_inference_steps=steps,
-        decode_formats=["gaussian"],   # skip mesh decoder entirely (ply2glb does it)
-        # Single-shot run: free each stage's models before the next stage
-        # allocates. Frees ~6 GB (ss_generator) + MoGe before SLAT — the key to
-        # not exhausting unified memory on 24 GB Macs.
-        free_stage_models=True,
-        with_mesh_postprocess=False,
-        with_texture_baking=False,
-        use_vertex_color=False,
-    )
-    ok(f"Done  ({time.time()-t0:.1f}s)")
+    progress = CliProgress(total=steps * 2 + 5)
+    try:
+        output = pipeline._pipeline.run(
+            PILImage.fromarray(rgba),
+            seed=seed,
+            stage1_inference_steps=steps,
+            stage2_inference_steps=steps,
+            decode_formats=["gaussian"],   # skip mesh decoder entirely (ply2glb does it)
+            # Single-shot run: free each stage's models before the next stage
+            # allocates. Frees stage-1 models before SLAT and moves finished
+            # splats to CPU before PLY serialization.
+            free_stage_models=True,
+            fail_on_nan=True,
+            return_pointmap=False,
+            return_latents=False,
+            with_mesh_postprocess=False,
+            with_texture_baking=False,
+            use_vertex_color=False,
+            progress_callback=progress,
+        )
+    except FloatingPointError as e:
+        progress.close()
+        err(f"{e}. Free memory (quit other GPU apps) and re-run; not writing a dead splat.ply.")
+        if _t.backends.mps.is_available():
+            _t.mps.empty_cache()
+        return False
+    except RuntimeError as e:
+        msg = str(e)
+        if any(s in msg.lower() for s in ("mps", "metal", "out of memory", "allocate", "allocation")):
+            progress.close()
+            err("MPS allocation failed during generation. Quit other GPU/RAM-heavy apps "
+                "and re-run; not writing a partial splat.ply.")
+            if _t.backends.mps.is_available():
+                _t.mps.empty_cache()
+            return False
+        progress.close()
+        raise
 
     gs = output.get("gs") or output["gaussian"][0]
-    if bool(_t.isnan(gs.get_xyz).any()) or bool(_t.isnan(gs._features_dc).any()):
-        err("Output is NaN (fp16 overflow — usually memory pressure). "
+    finite_tensors = (gs.get_xyz, gs._features_dc, gs._scaling, gs._rotation, gs._opacity)
+    if any(not bool(_t.isfinite(t).all().detach().cpu().item()) for t in finite_tensors if t is not None):
+        progress.close()
+        err("Output contains NaN/Inf (fp16 overflow — usually memory pressure). "
             "Free memory (quit other GPU apps) and re-run; not writing a dead splat.ply.")
         if _t.backends.mps.is_available():
             _t.mps.empty_cache()
         return False
 
     p_ply = os.path.join(obj_dir, "splat.ply")
-    gs.save_ply(p_ply)
+    slat = output.get("slat")
+    p_slat = None
+    try:
+        gs.save_ply(p_ply)
+        if slat is not None:
+            p_slat = os.path.join(obj_dir, "slat.pt")
+            _t.save({"feats": slat.feats.cpu(), "coords": slat.coords.cpu(),
+                     "shape": slat.shape}, p_slat)
+    except ValueError as e:
+        progress.close()
+        err(f"{e}. Not writing a dead splat.ply.")
+        return False
+    except Exception:
+        progress.close()
+        raise
+
+    progress.advance("Save outputs", 1)
+    progress.finish("Complete")
+    ok(f"Done  ({time.time()-t0:.1f}s)")
     saved("splat.ply", p_ply)
     ok(f"{gs.get_xyz.shape[0]:,} gaussians")
-
-    # Save the sparse latent so ply2glb.py can convert to a textured mesh later.
-    slat = output.get("slat")
-    if slat is not None:
-        p_slat = os.path.join(obj_dir, "slat.pt")
-        _t.save({"feats": slat.feats.cpu(), "coords": slat.coords.cpu(),
-                 "shape": slat.shape}, p_slat)
+    if p_slat is not None:
         saved("slat.pt", p_slat)
 
     # If launched via run.sh's full flow, record the obj dir so the wrapper can run

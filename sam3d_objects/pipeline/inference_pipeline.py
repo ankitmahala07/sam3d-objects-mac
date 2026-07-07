@@ -93,6 +93,7 @@ class InferencePipeline:
         compile_model=False,
         slat_mean=SLAT_MEAN,
         slat_std=SLAT_STD,
+        lazy_load_models=False,
     ):
         self.rendering_engine = rendering_engine
         self.device = torch.device(device)
@@ -121,6 +122,7 @@ class InferencePipeline:
             self.slat_rescale_t = slat_rescale_t
             self.slat_cfg_strength = slat_cfg_strength
             self.slat_cfg_interval = slat_cfg_interval
+            self._lazy_load_models = lazy_load_models
 
             self.dtype = self._get_dtype(dtype)
             if shape_model_dtype is None:
@@ -143,83 +145,52 @@ class InferencePipeline:
             self.pose_decoder = self.init_pose_decoder(ss_generator_config_path, pose_decoder_name)
             self.ss_preprocessor = self.init_ss_preprocessor(ss_preprocessor, ss_generator_config_path)
             self.slat_preprocessor = slat_preprocessor
-    
-            logger.info("Loading model weights...")
-
-            ss_generator = self.init_ss_generator(
-                ss_generator_config_path, ss_generator_ckpt_path
-            )
-            slat_generator = self.init_slat_generator(
-                slat_generator_config_path, slat_generator_ckpt_path
-            )
-            ss_decoder = self.init_ss_decoder(
-                ss_decoder_config_path, ss_decoder_ckpt_path
-            )
-            ss_encoder = self.init_ss_encoder(
-                ss_encoder_config_path, ss_encoder_ckpt_path
-            )
-            slat_decoder_gs = self.init_slat_decoder_gs(
-                slat_decoder_gs_config_path, slat_decoder_gs_ckpt_path
-            )
-            slat_decoder_gs_4 = self.init_slat_decoder_gs(
-                slat_decoder_gs_4_config_path, slat_decoder_gs_4_ckpt_path
-            )
-            if "mesh" in decode_formats:
-                slat_decoder_mesh = self.init_slat_decoder_mesh(
-                    slat_decoder_mesh_config_path, slat_decoder_mesh_ckpt_path
-                )
-            else:
-                slat_decoder_mesh = None
-
-            # Load conditioner embedder so that we only load it once
-            ss_condition_embedder = self.init_ss_condition_embedder(
-                ss_generator_config_path, ss_generator_ckpt_path
-            )
-            slat_condition_embedder = self.init_slat_condition_embedder(
-                slat_generator_config_path, slat_generator_ckpt_path
-            )
-
+            self.slat_mean = torch.tensor(slat_mean)
+            self.slat_std = torch.tensor(slat_std)
+            self._model_paths = {
+                "ss_generator_config_path": ss_generator_config_path,
+                "ss_generator_ckpt_path": ss_generator_ckpt_path,
+                "slat_generator_config_path": slat_generator_config_path,
+                "slat_generator_ckpt_path": slat_generator_ckpt_path,
+                "ss_decoder_config_path": ss_decoder_config_path,
+                "ss_decoder_ckpt_path": ss_decoder_ckpt_path,
+                "slat_decoder_gs_config_path": slat_decoder_gs_config_path,
+                "slat_decoder_gs_ckpt_path": slat_decoder_gs_ckpt_path,
+                "slat_decoder_gs_4_config_path": slat_decoder_gs_4_config_path,
+                "slat_decoder_gs_4_ckpt_path": slat_decoder_gs_4_ckpt_path,
+                "slat_decoder_mesh_config_path": slat_decoder_mesh_config_path,
+                "slat_decoder_mesh_ckpt_path": slat_decoder_mesh_ckpt_path,
+                "ss_encoder_config_path": ss_encoder_config_path,
+                "ss_encoder_ckpt_path": ss_encoder_ckpt_path,
+            }
+            self.models = torch.nn.ModuleDict()
             self.condition_embedders = {
-                "ss_condition_embedder": ss_condition_embedder,
-                "slat_condition_embedder": slat_condition_embedder,
+                "ss_condition_embedder": None,
+                "slat_condition_embedder": None,
             }
 
-            # override generator and condition embedder setting
-            self.override_ss_generator_cfg_config(
-                ss_generator,
-                cfg_strength=ss_cfg_strength,
-                inference_steps=ss_inference_steps,
-                rescale_t=ss_rescale_t,
-                cfg_interval=ss_cfg_interval,
-                cfg_strength_pm=ss_cfg_strength_pm,
-            )
-            self.override_slat_generator_cfg_config(
-                slat_generator,
-                cfg_strength=slat_cfg_strength,
-                inference_steps=slat_inference_steps,
-                rescale_t=slat_rescale_t,
-                cfg_interval=slat_cfg_interval,
-            )
+            logger.info("Loading model weights...")
 
-            self.models = torch.nn.ModuleDict(
-                {
-                    "ss_generator": ss_generator,
-                    "slat_generator": slat_generator,
-                    "ss_encoder": ss_encoder,
-                    "ss_decoder": ss_decoder,
-                    "slat_decoder_gs": slat_decoder_gs,
-                    "slat_decoder_gs_4": slat_decoder_gs_4,
-                    "slat_decoder_mesh": slat_decoder_mesh,
-                }
-            )
+            self._ensure_model("ss_generator")
+            self._ensure_model("ss_decoder")
+            self._ensure_condition_embedder("ss_condition_embedder")
+
+            if not self._lazy_load_models:
+                self._ensure_model("slat_generator")
+                self._ensure_condition_embedder("slat_condition_embedder")
+                self._ensure_model("ss_encoder")
+                if "gaussian" in decode_formats:
+                    self._ensure_model("slat_decoder_gs")
+                if "gaussian_4" in decode_formats:
+                    self._ensure_model("slat_decoder_gs_4")
+                if "mesh" in decode_formats:
+                    self._ensure_model("slat_decoder_mesh")
             logger.info("Loading model weights completed!")
 
             if self.compile_model:
                 logger.info("Compiling model...")
                 self._compile()
                 logger.info("Model compilation completed!")
-            self.slat_mean = torch.tensor(slat_mean)
-            self.slat_std = torch.tensor(slat_std)
 
     def _compile(self):
         torch._dynamo.config.cache_size_limit = 64
@@ -276,6 +247,81 @@ class InferencePipeline:
             ss_return_dict = self.sample_sparse_structure(ss_input_dict)
             coords = ss_return_dict["coords"]
             slat = self.sample_slat(slat_input_dict, coords)
+
+    def _ensure_model(self, key: str):
+        if key in self.models and self.models[key] is not None:
+            return self.models[key]
+
+        p = self._model_paths
+        if key == "ss_generator":
+            model = self.init_ss_generator(
+                p["ss_generator_config_path"], p["ss_generator_ckpt_path"]
+            )
+            self.override_ss_generator_cfg_config(
+                model,
+                cfg_strength=self.ss_cfg_strength,
+                inference_steps=self.ss_inference_steps,
+                rescale_t=self.ss_rescale_t,
+                cfg_interval=self.ss_cfg_interval,
+                cfg_strength_pm=self.ss_cfg_strength_pm,
+            )
+        elif key == "slat_generator":
+            model = self.init_slat_generator(
+                p["slat_generator_config_path"], p["slat_generator_ckpt_path"]
+            )
+            self.override_slat_generator_cfg_config(
+                model,
+                cfg_strength=self.slat_cfg_strength,
+                inference_steps=self.slat_inference_steps,
+                rescale_t=self.slat_rescale_t,
+                cfg_interval=self.slat_cfg_interval,
+            )
+        elif key == "ss_decoder":
+            model = self.init_ss_decoder(
+                p["ss_decoder_config_path"], p["ss_decoder_ckpt_path"]
+            )
+        elif key == "ss_encoder":
+            model = self.init_ss_encoder(
+                p["ss_encoder_config_path"], p["ss_encoder_ckpt_path"]
+            )
+        elif key == "slat_decoder_gs":
+            model = self.init_slat_decoder_gs(
+                p["slat_decoder_gs_config_path"], p["slat_decoder_gs_ckpt_path"]
+            )
+        elif key == "slat_decoder_gs_4":
+            model = self.init_slat_decoder_gs(
+                p["slat_decoder_gs_4_config_path"],
+                p["slat_decoder_gs_4_ckpt_path"],
+            )
+        elif key == "slat_decoder_mesh":
+            model = self.init_slat_decoder_mesh(
+                p["slat_decoder_mesh_config_path"],
+                p["slat_decoder_mesh_ckpt_path"],
+            )
+        else:
+            raise KeyError(f"Unknown model key: {key}")
+
+        if model is not None:
+            self.models[key] = model
+        return model
+
+    def _ensure_condition_embedder(self, key: str):
+        if self.condition_embedders.get(key) is not None:
+            return self.condition_embedders[key]
+
+        p = self._model_paths
+        if key == "ss_condition_embedder":
+            embedder = self.init_ss_condition_embedder(
+                p["ss_generator_config_path"], p["ss_generator_ckpt_path"]
+            )
+        elif key == "slat_condition_embedder":
+            embedder = self.init_slat_condition_embedder(
+                p["slat_generator_config_path"], p["slat_generator_ckpt_path"]
+            )
+        else:
+            raise KeyError(f"Unknown condition embedder key: {key}")
+        self.condition_embedders[key] = embedder
+        return embedder
 
     def instantiate_and_load_from_pretrained(
         self,
@@ -636,10 +682,13 @@ class InferencePipeline:
         ret = {}
         with torch.no_grad():
             if "mesh" in formats:
+                self._ensure_model("slat_decoder_mesh")
                 ret["mesh"] = self.models["slat_decoder_mesh"](slat)
             if "gaussian" in formats:
+                self._ensure_model("slat_decoder_gs")
                 ret["gaussian"] = self.models["slat_decoder_gs"](slat)
             if "gaussian_4" in formats:
+                self._ensure_model("slat_decoder_gs_4")
                 ret["gaussian_4"] = self.models["slat_decoder_gs_4"](slat)
         # if "radiance_field" in formats:
         #     ret["radiance_field"] = self.models["slat_decoder_rf"](slat)
@@ -670,9 +719,31 @@ class InferencePipeline:
 
         return condition_args, condition_kwargs
 
+    def _call_generator_with_progress(self, generator, progress_callback, *args, **kwargs):
+        if progress_callback is None:
+            return generator(*args, **kwargs)
+
+        sentinel = object()
+        previous_callback = getattr(generator, "progress_callback", sentinel)
+        generator.progress_callback = progress_callback
+        try:
+            return generator(*args, **kwargs)
+        finally:
+            if previous_callback is sentinel:
+                delattr(generator, "progress_callback")
+            else:
+                generator.progress_callback = previous_callback
+
     def sample_sparse_structure(
-        self, ss_input_dict: dict, inference_steps=None, use_distillation=False
+        self,
+        ss_input_dict: dict,
+        inference_steps=None,
+        use_distillation=False,
+        progress_callback=None,
     ):
+        self._ensure_model("ss_generator")
+        self._ensure_model("ss_decoder")
+        self._ensure_condition_embedder("ss_condition_embedder")
         ss_generator = self.models["ss_generator"]
         ss_decoder = self.models["ss_decoder"]
         if use_distillation:
@@ -714,7 +785,9 @@ class InferencePipeline:
                     ss_input_dict,
                     self.ss_condition_input_mapping,
                 )
-                return_dict = ss_generator(
+                return_dict = self._call_generator_with_progress(
+                    ss_generator,
+                    progress_callback,
                     latent_shape_dict,
                     image.device,
                     *condition_args,
@@ -755,7 +828,10 @@ class InferencePipeline:
         coords: torch.Tensor,
         inference_steps=25,
         use_distillation=False,
+        progress_callback=None,
     ) -> sp.SparseTensor:
+        self._ensure_model("slat_generator")
+        self._ensure_condition_embedder("slat_condition_embedder")
         image = slat_input["image"]
         DEVICE = image.device
         slat_generator = self.models["slat_generator"]
@@ -786,8 +862,13 @@ class InferencePipeline:
                     self.slat_condition_input_mapping,
                 )
                 condition_args += (coords.cpu().numpy(),)
-                slat = slat_generator(
-                    latent_shape, DEVICE, *condition_args, **condition_kwargs
+                slat = self._call_generator_with_progress(
+                    slat_generator,
+                    progress_callback,
+                    latent_shape,
+                    DEVICE,
+                    *condition_args,
+                    **condition_kwargs,
                 )
                 slat = sp.SparseTensor(
                     coords=coords,
