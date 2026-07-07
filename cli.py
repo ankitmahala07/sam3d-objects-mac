@@ -6,7 +6,8 @@ Streamlined full pipeline:
     1. Ask for an image  (always treated as a raw photo — the background is
        removed here with rembg, so you never need to pre-extract it)
     2. Ask for an output folder name  (created as  ./outputs/<name>/ )
-    3. Run the full 3D pipeline immediately  (voxel → gaussian splat)
+    3. Pick quality and export mode
+    4. Run the full 3D pipeline immediately  (voxel → gaussian splat)
 
 Writes  extracted.png, splat.ply, slat.pt  into  outputs/<name>/.
 The textured GLB is produced afterwards by ply2glb.py (see  ./run.sh  →  full flow).
@@ -15,6 +16,7 @@ The textured GLB is produced afterwards by ply2glb.py (see  ./run.sh  →  full 
 import sys, os, subprocess, time, random
 import numpy as np
 from PIL import Image as PILImage
+from sam3d_progress import CliProgress
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
@@ -37,79 +39,19 @@ def warn(msg):  print(f"  {Y}⚠{RST}   {msg}")
 def err(msg):   print(f"  {R}✗{RST}   {msg}")
 
 
-class CliProgress:
-    def __init__(self, total, width=34):
-        self.total = max(1, int(total))
-        self.width = width
-        self.done = 0
-        self.label = "Starting"
-        self.started = time.time()
-        self.live = sys.stdout.isatty()
-        self._rendered = False
-        self._last_render = 0.0
-        self._stage_steps = {}
+def int_env(name, default=0):
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
 
-    def __call__(self, event, **payload):
-        if event == "phase":
-            self.label = payload.get("label", self.label)
-            self._render(force=True)
-            return
 
-        if event == "advance":
-            self.label = payload.get("label", self.label)
-            self._add(payload.get("amount", 1))
-            self._render(force=True)
-            return
-
-        if event == "diffusion":
-            label = payload.get("label", "Diffusion")
-            current = int(payload.get("current", 0))
-            total = max(1, int(payload.get("total", 1)))
-            previous = self._stage_steps.get(label, 0)
-            self._stage_steps[label] = current
-            self.label = f"{label} {current}/{total}"
-            self._add(max(0, current - previous))
-            self._render()
-
-    def advance(self, label, amount=1):
-        self("advance", label=label, amount=amount)
-
-    def finish(self, label="Complete"):
-        self.done = self.total
-        self.label = label
-        self._render(force=True)
-        self.close()
-
-    def close(self):
-        if self.live and self._rendered:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-        self._rendered = False
-
-    def _add(self, amount):
-        self.done = min(self.total, self.done + int(amount))
-
-    def _render(self, force=False):
-        now = time.time()
-        if not force and now - self._last_render < 0.15 and self.done < self.total:
-            return
-        self._last_render = now
-
-        pct = self.done / self.total
-        filled = min(self.width, int(round(self.width * pct)))
-        bar = "#" * filled + "-" * (self.width - filled)
-        elapsed = int(now - self.started)
-        text = (
-            f"  {C}›{RST}  [{bar}] {pct * 100:5.1f}%  "
-            f"{self.done}/{self.total}  {self.label}  {elapsed}s"
-        )
-
-        if self.live:
-            sys.stdout.write("\r" + text + "\033[K")
-            sys.stdout.flush()
-            self._rendered = True
-        elif force:
-            print(text, flush=True)
+def export_progress_units(mode):
+    if mode == "game":
+        return 11
+    if mode == "both":
+        return 21
+    return 10
 
 
 def ask(prompt, default=None):
@@ -189,14 +131,34 @@ def get_steps():
     return steps
 
 
+def get_export_mode():
+    hdr("STEP 4 — GLB OUTPUT")
+    print(f"  {B}?{RST}  Which GLB should be generated?")
+    print(f"     {G}▶{RST} [1] Game        ·  low-poly game mesh (default)")
+    print(f"       [2] Unoptimised ·  original high-detail mesh")
+    print(f"       [3] Both        ·  mesh_game.glb + mesh.glb")
+    while True:
+        raw = ask("Enter 1–3", 1)
+        if raw == "1":
+            ok("Game output → mesh_game.glb")
+            return "game"
+        if raw == "2":
+            ok("Unoptimised output → mesh.glb")
+            return "unoptimised"
+        if raw == "3":
+            ok("Both outputs → mesh_game.glb and mesh.glb")
+            return "both"
+        err("Enter a number between 1 and 3.")
+
+
 # ── full pipeline ─────────────────────────────────────────────────────────────
-def run_pipeline(img_rgb, mask, obj_dir, steps):
+def run_pipeline(img_rgb, mask, obj_dir, steps, export_mode):
     import torch as _t
 
     hdr("GPU / MEMORY CHECK")
     try:
         gpu_procs = subprocess.check_output(
-            ["pgrep", "-lf", "Claude Helper|ollama"],
+            ["pgrep", "-lf", "ollama|ComfyUI|webui"],
             text=True, stderr=subprocess.DEVNULL
         ).strip().splitlines()
         if gpu_procs:
@@ -233,7 +195,10 @@ def run_pipeline(img_rgb, mask, obj_dir, steps):
     if _t.backends.mps.is_available():
         _t.mps.empty_cache()
     t0 = time.time()
-    progress = CliProgress(total=steps * 2 + 5)
+    splat_progress_units = steps * 2 + 5
+    manifest = os.environ.get("SAM3D_MANIFEST")
+    glb_progress_units = export_progress_units(export_mode) if manifest else 0
+    progress = CliProgress(total=splat_progress_units + glb_progress_units)
     try:
         output = pipeline._pipeline.run(
             PILImage.fromarray(rgba),
@@ -298,8 +263,12 @@ def run_pipeline(img_rgb, mask, obj_dir, steps):
         progress.close()
         raise
 
-    progress.advance("Save outputs", 1)
-    progress.finish("Complete")
+    progress.advance("Save splat outputs", 1)
+    if glb_progress_units:
+        progress("phase", label="Splat ready; GLB next")
+        progress.close()
+    else:
+        progress.finish("Complete")
     ok(f"Done  ({time.time()-t0:.1f}s)")
     saved("splat.ply", p_ply)
     ok(f"{gs.get_xyz.shape[0]:,} gaussians")
@@ -308,10 +277,9 @@ def run_pipeline(img_rgb, mask, obj_dir, steps):
 
     # If launched via run.sh's full flow, record the obj dir so the wrapper can run
     # the GLB step after this process exits (freeing all CLI memory first).
-    manifest = os.environ.get("SAM3D_MANIFEST")
     if manifest and slat is not None:
         with open(manifest, "a") as _mf:
-            _mf.write(obj_dir + "\n")
+            _mf.write(f"{obj_dir}\t{progress.done}\t{progress.total}\t{export_mode}\tauto\n")
     return True
 
 
@@ -323,16 +291,17 @@ def main():
     img_rgb  = get_image()
     obj_dir  = get_output_folder()
     steps    = get_steps()
+    export_mode = get_export_mode()
 
     # Always extract: find the largest foreground component with rembg.
     from app import _fg_components
-    hdr("STEP 4 — EXTRACT (rembg)")
+    hdr("STEP 5 — EXTRACT (rembg)")
     step("Running rembg foreground detection…")
     comps = _fg_components(img_rgb)
     ok(f"Found {len(comps)} foreground component(s)")
     mask = comps[0] if comps else np.ones(img_rgb.shape[:2], bool)
 
-    run_pipeline(img_rgb, mask, obj_dir, steps)
+    run_pipeline(img_rgb, mask, obj_dir, steps, export_mode)
     hdr("ALL DONE")
 
 

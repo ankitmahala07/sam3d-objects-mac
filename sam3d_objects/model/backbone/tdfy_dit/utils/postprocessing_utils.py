@@ -364,6 +364,75 @@ def postprocess_mesh(
     return vertices, faces
 
 
+def resolve_game_target_faces(face_count, target_faces=None):
+    if target_faces is not None:
+        return max(4, min(int(target_faces), int(face_count)))
+    if face_count <= 2500:
+        return int(face_count)
+    if face_count <= 20000:
+        return 2000
+    if face_count <= 80000:
+        return 5000
+    return 10000
+
+
+def game_remesh_mesh(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    target_faces=None,
+    boundary_weight: float = 10.0,
+    verbose: bool = False,
+):
+    import open3d as o3d
+
+    target = resolve_game_target_faces(faces.shape[0], target_faces)
+    if target >= faces.shape[0]:
+        if verbose:
+            tqdm.write(
+                f"Game remesh skipped: {faces.shape[0]} faces already <= target {target}"
+            )
+        return vertices, faces
+
+    if verbose:
+        tqdm.write(
+            f"Game remesh: {vertices.shape[0]} vertices, {faces.shape[0]} faces -> "
+            f"target {target} faces"
+        )
+
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(vertices.astype(np.float64))
+    mesh.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
+    mesh.remove_duplicated_vertices()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_degenerate_triangles()
+    mesh.remove_unreferenced_vertices()
+
+    mesh = mesh.simplify_quadric_decimation(
+        target_number_of_triangles=target,
+        boundary_weight=boundary_weight,
+    )
+    mesh.remove_duplicated_vertices()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_degenerate_triangles()
+    mesh.remove_non_manifold_edges()
+    mesh.remove_unreferenced_vertices()
+    mesh.compute_vertex_normals()
+
+    remesh_vertices = np.asarray(mesh.vertices).astype(np.float32)
+    remesh_faces = np.asarray(mesh.triangles).astype(np.int64)
+    if remesh_vertices.size == 0 or remesh_faces.size == 0:
+        if verbose:
+            tqdm.write("Game remesh produced an empty mesh; keeping cleaned mesh")
+        return vertices, faces
+
+    if verbose:
+        tqdm.write(
+            f"After game remesh: {remesh_vertices.shape[0]} vertices, "
+            f"{remesh_faces.shape[0]} faces"
+        )
+    return remesh_vertices, remesh_faces
+
+
 def parametrize_mesh(vertices: np.array, faces: np.array):
     """
     Parametrize a mesh to a texture space, using xatlas.
@@ -681,6 +750,130 @@ def bake_texture(
     return texture
 
 
+def _empty_device_cache(device):
+    device_type = torch.device(device).type
+    if device_type == "mps" and hasattr(torch, "mps"):
+        torch.mps.empty_cache()
+    elif device_type == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _emit_progress(progress_callback, label, amount=1):
+    if progress_callback is not None and amount > 0:
+        progress_callback("advance", label=label, amount=amount)
+
+
+def bake_texture_average_streaming(
+    app_rep: Gaussian,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    uvs: np.ndarray,
+    texture_size: int = 2048,
+    nviews: int = 100,
+    render_resolution: int = 1024,
+    near: float = 1,
+    far: float = 3,
+    verbose: bool = True,
+    device: str = None,
+    progress_callback=None,
+    progress_units: int = 0,
+):
+    """Angle-weighted texture baking without storing all rendered views at once."""
+    if device is None:
+        device = "mps" if torch.backends.mps.is_available() and not torch.cuda.is_available() else "cuda"
+
+    from ..renderers.mesh_raster_silicon import rasterize_mesh
+    from .render_utils import yaw_pitch_r_fov_to_extrinsics_intrinsics
+
+    vertices = torch.tensor(vertices, dtype=torch.float32, device=device)
+    faces_l = torch.tensor(faces.astype(np.int32), device=device).long()
+    uvs = torch.tensor(uvs, dtype=torch.float32, device=device)
+
+    v0 = vertices[faces_l[:, 0]]
+    v1 = vertices[faces_l[:, 1]]
+    v2 = vertices[faces_l[:, 2]]
+    face_n = torch.nn.functional.normalize(torch.cross(v1 - v0, v2 - v0, dim=1), dim=1)
+
+    tex_sum = torch.zeros(texture_size * texture_size, 3, device=device)
+    tex_w = torch.zeros(texture_size * texture_size, device=device)
+
+    renderer = GaussianRenderer()
+    renderer.rendering_options.resolution = render_resolution
+    renderer.rendering_options.near = 0.8
+    renderer.rendering_options.far = 1.6
+    renderer.rendering_options.bg_color = (0, 0, 0)
+    renderer.rendering_options.ssaa = 1
+    renderer.rendering_options.backend = (
+        "gsplat" if torch.device(device).type == "mps" else "inria"
+    )
+    renderer.pipe.kernel_size = 0.1
+    renderer.pipe.use_mip_gaussian = True
+
+    cams = [sphere_hammersley_sequence(i, nviews) for i in range(nviews)]
+    yaws = [cam[0] for cam in cams]
+    pitchs = [cam[1] for cam in cams]
+    extrinsics, intrinsics = yaw_pitch_r_fov_to_extrinsics_intrinsics(
+        yaws, pitchs, 2, 40
+    )
+
+    progressed = 0
+    for i in tqdm(
+        range(nviews),
+        total=nviews,
+        disable=not verbose,
+        desc="Texture baking (average)",
+    ):
+        extr = extrinsics[i].to(device)
+        intr = intrinsics[i].to(device)
+        with torch.no_grad():
+            rendered = renderer.render(app_rep, extr, intr)["color"]
+            observation = rendered.detach().permute(1, 2, 0).float().clamp(0, 1)
+            H, W = observation.shape[:2]
+
+            view = utils3d.torch.extrinsics_to_view(extr)
+            projection = utils3d.torch.intrinsics_to_perspective(intr, near, far)
+            out = rasterize_mesh(vertices, faces_l, projection @ view, H, W)
+            fid = out["face_id"]
+            sel = out["mask"]
+            if bool(sel.any()):
+                uvp = (
+                    out["bary"].unsqueeze(-1)
+                    * uvs[faces_l[fid.clamp_min(0)]]
+                ).sum(2)
+                cam_fwd = extr.to(dtype=torch.float32)[2, :3]
+                facing = (
+                    -(face_n[fid.clamp_min(0)] * cam_fwd[None, None, :]).sum(-1)
+                ).clamp(min=0.0) ** 2
+                col = observation[sel]
+                wsel = facing[sel]
+                uvpx = (uvp[sel].clamp(0, 1) * (texture_size - 1)).long()
+                lin = uvpx[:, 1] * texture_size + uvpx[:, 0]
+                tex_sum.index_add_(0, lin, col * wsel[:, None])
+                tex_w.index_add_(0, lin, wsel)
+                del uvp, cam_fwd, facing, col, wsel, uvpx, lin
+
+        del extr, intr, rendered, observation, view, projection, out, fid, sel
+        _empty_device_cache(device)
+
+        target_progress = ((i + 1) * progress_units) // max(1, nviews)
+        if target_progress > progressed:
+            _emit_progress(
+                progress_callback,
+                f"Texture bake {i + 1}/{nviews}",
+                target_progress - progressed,
+            )
+            progressed = target_progress
+
+    cov = tex_w > 0
+    tex_sum[cov] = tex_sum[cov] / tex_w[cov][:, None]
+    texture = (tex_sum.reshape(texture_size, texture_size, 3).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+    inpaint_mask = (~cov).reshape(texture_size, texture_size).cpu().numpy().astype(np.uint8)
+    texture = cv2.inpaint(texture, inpaint_mask, 3, cv2.INPAINT_TELEA)
+    texture = np.ascontiguousarray(texture[::-1])
+    _empty_device_cache(device)
+    return texture
+
+
 def to_glb(
     app_rep: Union[Strivec, Gaussian],
     mesh: MeshExtractResult,
@@ -692,12 +885,17 @@ def to_glb(
     texture_size: int = 1024,
     lambda_tv: float = 0.01,
     texture_mode: str = "opt",   # "opt" (Adam) | "average" (smooth angle-weighted) | "fast"
+    texture_views: int = 100,
+    texture_render_resolution: int = 1024,
+    game_remesh: bool = False,
+    game_target_faces: Optional[int] = None,
     debug: bool = False,
     verbose: bool = True,
     with_mesh_postprocess=True,
     with_texture_baking=True,
     use_vertex_color=False,
     rendering_engine: str = "nvdiffrast",  # nvdiffrast OR "pytorch3d"
+    progress_callback=None,
 ) -> trimesh.Trimesh:
     """
     Convert a generated asset to a glb file.
@@ -731,33 +929,59 @@ def to_glb(
             debug=debug,
             verbose=verbose,
         )
+        _emit_progress(progress_callback, "Mesh cleanup", 1)
+
+    if game_remesh:
+        vertices, faces = game_remesh_mesh(
+            vertices,
+            faces,
+            target_faces=game_target_faces,
+            verbose=verbose,
+        )
+        _emit_progress(progress_callback, "Game remesh", 1)
 
     if with_texture_baking:
         # parametrize mesh
         vertices, faces, uvs = parametrize_mesh(vertices, faces)
         logger.info("Baking texture ...")
+        _emit_progress(progress_callback, "UV unwrap", 1)
 
-        # bake texture
-        observations, extrinsics, intrinsics = render_multiview(
-            app_rep, resolution=1024, nviews=100
-        )
-        masks = [np.any(observation > 0, axis=-1) for observation in observations]
-        extrinsics = [extrinsics[i].cpu().numpy() for i in range(len(extrinsics))]
-        intrinsics = [intrinsics[i].cpu().numpy() for i in range(len(intrinsics))]
-        texture = bake_texture(
-            vertices,
-            faces,
-            uvs,
-            observations,
-            masks,
-            extrinsics,
-            intrinsics,
-            texture_size=texture_size,
-            mode=texture_mode,
-            lambda_tv=lambda_tv,
-            verbose=verbose,
-            rendering_engine=rendering_engine
-        )
+        if texture_mode == "average" and isinstance(app_rep, Gaussian):
+            texture = bake_texture_average_streaming(
+                app_rep,
+                vertices,
+                faces,
+                uvs,
+                texture_size=texture_size,
+                nviews=texture_views,
+                render_resolution=texture_render_resolution,
+                verbose=verbose,
+                progress_callback=progress_callback,
+                progress_units=3,
+            )
+        else:
+            # bake texture
+            observations, extrinsics, intrinsics = render_multiview(
+                app_rep, resolution=texture_render_resolution, nviews=texture_views
+            )
+            masks = [np.any(observation > 0, axis=-1) for observation in observations]
+            extrinsics = [extrinsics[i].cpu().numpy() for i in range(len(extrinsics))]
+            intrinsics = [intrinsics[i].cpu().numpy() for i in range(len(intrinsics))]
+            texture = bake_texture(
+                vertices,
+                faces,
+                uvs,
+                observations,
+                masks,
+                extrinsics,
+                intrinsics,
+                texture_size=texture_size,
+                mode=texture_mode,
+                lambda_tv=lambda_tv,
+                verbose=verbose,
+                rendering_engine=rendering_engine
+            )
+            _emit_progress(progress_callback, "Texture bake", 3)
         texture = Image.fromarray(texture)
         material = trimesh.visual.material.PBRMaterial(
             roughnessFactor=1.0,

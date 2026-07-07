@@ -685,14 +685,47 @@ class InferencePipeline:
                 self._ensure_model("slat_decoder_mesh")
                 ret["mesh"] = self.models["slat_decoder_mesh"](slat)
             if "gaussian" in formats:
-                self._ensure_model("slat_decoder_gs")
-                ret["gaussian"] = self.models["slat_decoder_gs"](slat)
+                ret["gaussian"] = self._decode_gaussian_with_retry(
+                    "slat_decoder_gs", slat
+                )
             if "gaussian_4" in formats:
-                self._ensure_model("slat_decoder_gs_4")
-                ret["gaussian_4"] = self.models["slat_decoder_gs_4"](slat)
+                ret["gaussian_4"] = self._decode_gaussian_with_retry(
+                    "slat_decoder_gs_4", slat
+                )
         # if "radiance_field" in formats:
         #     ret["radiance_field"] = self.models["slat_decoder_rf"](slat)
         return ret
+
+    @staticmethod
+    def _gaussian_outputs_finite(gaussians):
+        for gs in gaussians or ():
+            for name in ("_xyz", "_features_dc", "_scaling", "_rotation", "_opacity"):
+                tensor = getattr(gs, name, None)
+                if tensor is None or not torch.is_floating_point(tensor):
+                    continue
+                if not bool(torch.isfinite(tensor).all().detach().cpu().item()):
+                    return False
+        return True
+
+    def _decode_gaussian_with_retry(self, model_key, slat):
+        self._ensure_model(model_key)
+        model = self.models[model_key]
+        gaussians = model(slat)
+        if self._gaussian_outputs_finite(gaussians):
+            return gaussians
+
+        if self.device.type != "mps" or not hasattr(model, "convert_to_fp32"):
+            return gaussians
+
+        logger.warning(
+            "{} produced NaN/Inf in fp16; retrying gaussian decode in fp32",
+            model_key,
+        )
+        model.convert_to_fp32()
+        if hasattr(model, "dtype"):
+            model.dtype = torch.float32
+        gaussians = model(slat.float())
+        return gaussians
 
     def is_mm_dit(self, model_name="ss_generator"):
         return hasattr(self.models[model_name].reverse_fn.backbone, "latent_mapping")

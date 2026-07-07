@@ -45,13 +45,15 @@ def chunked_sdpa_bhlc(q, k, v, chunk_size=None):
     """Scaled dot-product attention for [B, H, L, C] tensors without MPS SDPA."""
     chunk_size = mps_chunk_size() if chunk_size is None else chunk_size
     scale_factor = 1 / math.sqrt(q.size(-1))
-    k_t = k.transpose(-2, -1).contiguous()
+    out_dtype = v.dtype
+    k_t = k.float().transpose(-2, -1).contiguous()
+    v = v.float()
     out_chunks = []
     for start in range(0, q.shape[-2], chunk_size):
-        q_chunk = q[..., start : start + chunk_size, :]
+        q_chunk = q[..., start : start + chunk_size, :].float()
         attn = torch.matmul(q_chunk, k_t) * scale_factor
-        attn = torch.softmax(attn.float(), dim=-1).to(v.dtype)
-        out_chunks.append(torch.matmul(attn, v))
+        attn = torch.softmax(attn, dim=-1)
+        out_chunks.append(torch.matmul(attn, v).to(out_dtype))
     return torch.cat(out_chunks, dim=-2)
 
 

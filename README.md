@@ -115,22 +115,30 @@ checkpoints/hf/checkpoints/
 ./run.sh
 ```
 
-That's the whole thing. It asks three questions and then runs end to end:
+That's the whole thing. It asks for the source image, output folder, quality,
+and GLB output mode, then runs end to end:
 
 1. **Image path** — any ordinary photo. The background is removed automatically
    (rembg); you do **not** need to pre-extract the object.
 2. **Output folder name** — results are written to `outputs/<name>/`.
 3. **Quality** — diffusion steps for both stages:
    `Low = 10` (default), `Medium = 25`, `High = 50`, or a custom value.
+4. **GLB output** — choose the generated mesh export:
+   `Game` (default), `Unoptimised`, or `Both`.
 
 Output in `outputs/<name>/`:
 
-| File            | What it is                                    |
-|-----------------|-----------------------------------------------|
-| `extracted.png` | the object with background removed (RGBA)     |
-| `splat.ply`     | the raw gaussian splat                        |
-| `slat.pt`       | the sparse latent (input to the mesh decoder) |
-| `mesh.glb`      | the final **textured mesh**                   |
+| File            | What it is                                             |
+|-----------------|--------------------------------------------------------|
+| `extracted.png` | the object with background removed (RGBA)              |
+| `splat.ply`     | the raw gaussian splat                                 |
+| `slat.pt`       | the sparse latent (input to the mesh decoder)          |
+| `mesh_game.glb` | optional/default game-oriented low-poly textured mesh  |
+| `mesh.glb`      | optional unoptimised high-detail textured mesh         |
+
+The `Game` export remeshes before UV unwrap and texture baking, so the texture is
+baked directly onto the lower-poly asset. `Both` creates `mesh_game.glb` first
+and then `mesh.glb` for side-by-side comparison.
 
 **Re-bake the mesh only** (skips the expensive splat step) from an existing
 `splat.ply` + `slat.pt`:
@@ -138,6 +146,31 @@ Output in `outputs/<name>/`:
 ```bash
 ./run.sh glb outputs/<name>
 ```
+
+**Create only the game mesh** from an existing result folder:
+
+```bash
+./run.sh game outputs/<name> 2000
+```
+
+Use `auto` instead of a number to pick a target automatically.
+
+---
+
+## Example results
+
+Generated crate sample:
+
+<p>
+  <img src="outputs/crate/extracted.png" width="360" alt="Generated crate cutout">
+</p>
+
+| Result | Faces | File |
+|--------|------:|------|
+| Game mesh | 2,000 | [`outputs/crate/mesh_game.glb`](outputs/crate/mesh_game.glb) |
+| Unoptimised mesh | 14,994 | [`outputs/crate/mesh.glb`](outputs/crate/mesh.glb) |
+
+Open either `.glb` link on GitHub to use its built-in rotatable 3D viewer.
 
 ---
 

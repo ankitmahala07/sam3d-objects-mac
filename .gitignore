@@ -17,7 +17,12 @@ dist/
 /checkpoints/hf/
 
 # ── Generated results ───────────────────────────────────
-/outputs/
+/outputs/*
+!/outputs/crate/
+/outputs/crate/*
+!/outputs/crate/extracted.png
+!/outputs/crate/mesh.glb
+!/outputs/crate/mesh_game.glb
 
 # ── Virtual environments ────────────────────────────────
 /s3d_env/
