@@ -24,9 +24,6 @@ os.environ.setdefault("SPARSE_BACKEND", "native")
 os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
-# Diffusion steps for both stages (STANDARD quality ≈ 12 min on Apple Silicon).
-STEPS = 25
-
 # ── colour helpers ────────────────────────────────────────────────────────────
 R    = "\033[91m"; G  = "\033[92m"; Y  = "\033[93m"
 B    = "\033[94m"; M  = "\033[95m"; C  = "\033[96m"
@@ -86,8 +83,38 @@ def get_output_folder():
         return folder
 
 
+def get_steps():
+    """Pick diffusion steps (both stages) before the pipeline runs.
+    Low (10) is the default and the only safe choice on 24 GB machines — higher
+    step counts mostly just cost time (see README)."""
+    hdr("STEP 3 — QUALITY")
+    print(f"  {B}?{RST}  Diffusion steps (applied to both stages)")
+    print(f"     {G}▶{RST} [1] Low     ·  10 steps   (recommended · required for 24 GB unified memory)")
+    print(f"       [2] Medium  ·  25 steps")
+    print(f"       [3] High    ·  50 steps")
+    print(f"       [4] Custom")
+    while True:
+        raw = ask("Enter 1–4", 1)
+        if raw == "1": steps = 10; break
+        if raw == "2": steps = 25; break
+        if raw == "3": steps = 50; break
+        if raw == "4":
+            while True:
+                c = ask("Custom steps (positive integer)").strip()
+                if c.isdigit() and int(c) > 0:
+                    steps = int(c); break
+                err("Enter a positive integer.")
+            break
+        err("Enter a number between 1 and 4.")
+    if steps > 10:
+        warn("More than 10 steps needs > 24 GB free and can crash on a 24 GB Mac. "
+             "Quality gain is marginal (~3–5% more geometry); mostly it just takes longer.")
+    ok(f"{steps} steps")
+    return steps
+
+
 # ── full pipeline ─────────────────────────────────────────────────────────────
-def run_pipeline(img_rgb, mask, obj_dir):
+def run_pipeline(img_rgb, mask, obj_dir, steps):
     import torch as _t
 
     hdr("GPU / MEMORY CHECK")
@@ -124,13 +151,13 @@ def run_pipeline(img_rgb, mask, obj_dir):
     # pressure; we detect it and refuse to write a dead splat, but we do NOT retry
     # in-process — the prior attempt's ~15 GB stays allocated and a second run hits a
     # hard Metal allocation crash. Retry by re-running as a fresh process.
-    step(f"Running  (steps={STEPS}  seed={seed})…")
+    step(f"Running  (steps={steps}  seed={seed})…")
     t0 = time.time()
     output = pipeline._pipeline.run(
         PILImage.fromarray(rgba),
         seed=seed,
-        stage1_inference_steps=STEPS,
-        stage2_inference_steps=STEPS,
+        stage1_inference_steps=steps,
+        stage2_inference_steps=steps,
         decode_formats=["gaussian"],   # skip mesh decoder entirely (ply2glb does it)
         with_mesh_postprocess=False,
         with_texture_baking=False,
@@ -175,16 +202,17 @@ def main():
 
     img_rgb  = get_image()
     obj_dir  = get_output_folder()
+    steps    = get_steps()
 
     # Always extract: find the largest foreground component with rembg.
     from app import _fg_components
-    hdr("STEP 3 — EXTRACT (rembg)")
+    hdr("STEP 4 — EXTRACT (rembg)")
     step("Running rembg foreground detection…")
     comps = _fg_components(img_rgb)
     ok(f"Found {len(comps)} foreground component(s)")
     mask = comps[0] if comps else np.ones(img_rgb.shape[:2], bool)
 
-    run_pipeline(img_rgb, mask, obj_dir)
+    run_pipeline(img_rgb, mask, obj_dir, steps)
     hdr("ALL DONE")
 
 

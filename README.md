@@ -99,11 +99,13 @@ checkpoints/hf/checkpoints/
 ./run.sh
 ```
 
-That's the whole thing. It asks two questions and then runs end to end:
+That's the whole thing. It asks three questions and then runs end to end:
 
 1. **Image path** — any ordinary photo. The background is removed automatically
    (rembg); you do **not** need to pre-extract the object.
 2. **Output folder name** — results are written to `outputs/<name>/`.
+3. **Quality** — diffusion steps for both stages:
+   `Low = 10` (default), `Medium = 25`, `High = 50`, or a custom value.
 
 Output in `outputs/<name>/`:
 
@@ -120,6 +122,29 @@ Output in `outputs/<name>/`:
 ```bash
 ./run.sh glb outputs/<name>
 ```
+
+---
+
+## Performance & memory  ⚠️
+
+A full run takes roughly **40–80 minutes** depending on the quality you pick.
+
+**If you have 24 GB of unified memory, use Low (10 steps) only.** Medium/High
+need more headroom and will typically crash a 24 GB Mac (out-of-memory →
+all-NaN result or an `Abort trap: 6`).
+
+More steps buy you very little. Going from 10 → 50 steps produced only about
+**3% more vertices and 5% more faces** in testing — while Stage 1 alone gets much
+slower:
+
+| Quality      | Steps | Stage-1 time (avg) | Geometry vs. Low |
+|--------------|-------|--------------------|------------------|
+| **Low**      | 10    | ~10 min            | baseline         |
+| Medium       | 25    | ~24 min            | ≈ +a few %       |
+| High         | 50    | ~45 min            | ~+3% verts / +5% faces |
+
+The difference in the final mesh is minor; the main cost of higher steps is time
+(and memory). Low is the recommended setting for almost everyone.
 
 ---
 
