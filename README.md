@@ -32,6 +32,22 @@ Ollama, etc.) before a run — memory pressure is the usual cause of a failed
 
 ## Install
 
+### Easiest: guided setup (recommended for non-technical users)
+
+```bash
+./setup.sh
+```
+
+`setup.sh` walks you through the whole thing — it checks/installs Python, creates
+the environment, installs the packages, opens the Hugging Face pages you need,
+logs you in, and downloads the model weights. When it finishes, just run
+`./run.sh`. (Your Hugging Face token is entered into Hugging Face's own tool and
+is never stored in this project.)
+
+Prefer to do it by hand? Follow the manual steps below.
+
+### Manual install
+
 ```bash
 # 1. Create a Python 3.11 virtual environment next to the repo
 python3.11 -m venv ../s3d_env
