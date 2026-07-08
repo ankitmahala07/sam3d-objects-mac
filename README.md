@@ -125,6 +125,8 @@ and GLB output mode, then runs end to end:
    `Low = 10` (default), `Medium = 25`, `High = 50`, or a custom value.
 4. **GLB output** — choose the generated mesh export:
    `Game` (default), `Unoptimised`, or `Both`.
+5. **Game mesh settings** — shown only for `Game` or `Both`: target face count
+   and remesh method.
 
 Output in `outputs/<name>/`:
 
@@ -140,6 +142,17 @@ The `Game` export remeshes before UV unwrap and texture baking, so the texture i
 baked directly onto the lower-poly asset. `Both` creates `mesh_game.glb` first
 and then `mesh.glb` for side-by-side comparison.
 
+Game remesh methods:
+
+| Method | Use when | Notes |
+|--------|----------|-------|
+| Existing | you want the stable current flow | fast quadric decimation to the requested face budget |
+| Experimental | complex objects need more shape preservation | keeps more source geometry before reduction and uses feature-aware retopo |
+
+GLB files are runtime meshes and are stored as triangles. The experimental mode
+tries to produce cleaner automatic topology, but true senior-artist quad loops
+still require a dedicated retopology tool or manual cleanup in a DCC app.
+
 **Re-bake the mesh only** (skips the expensive splat step) from an existing
 `splat.ply` + `slat.pt`:
 
@@ -150,10 +163,11 @@ and then `mesh.glb` for side-by-side comparison.
 **Create only the game mesh** from an existing result folder:
 
 ```bash
-./run.sh game outputs/<name> 2000
+./run.sh game outputs/<name> 2000 experimental
 ```
 
-Use `auto` instead of a number to pick a target automatically.
+Use `auto` instead of a number to pick a target automatically. Use `decimate`
+instead of `experimental` for the stable existing method.
 
 ---
 

@@ -4,9 +4,9 @@ ply2glb — Convert a SAM-3D gaussian splat to a textured GLB mesh.
 
 Usage:
     python ply2glb.py <output_folder>
-    python ply2glb.py --game-ready --target-faces 2000 <output_folder>
+    python ply2glb.py --game-ready --target-faces 2000 --remesh-method decimate <output_folder>
     ./run.sh glb <output_folder>
-    ./run.sh game <output_folder> [target_faces]
+    ./run.sh game <output_folder> [target_faces] [decimate|experimental]
 
 Loads only the mesh decoder (~500 MB), not the full inference pipeline.
 Requires slat.pt and splat.ply to exist in <output_folder>.
@@ -69,6 +69,15 @@ def parse_target_faces(raw):
     return value
 
 
+def parse_remesh_method(raw):
+    value = (raw or "decimate").strip().lower()
+    if value in ("decimate", "stable", "existing", "quadric"):
+        return "decimate"
+    if value in ("experimental", "retopo", "artist", "feature", "feature-aware"):
+        return "experimental"
+    err(f"Invalid remesh method: {raw}. Use decimate or experimental.")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Convert SAM-3D splat/slat outputs to a textured GLB."
@@ -88,6 +97,11 @@ def parse_args():
         "--target-faces",
         default="auto",
         help="Target triangle count for --game-ready. Use 'auto' or an integer.",
+    )
+    parser.add_argument(
+        "--remesh-method",
+        default="decimate",
+        help="Game remesh method: decimate (stable) or experimental (feature-aware).",
     )
     parser.add_argument(
         "--output",
@@ -147,6 +161,7 @@ def main():
     out_name = args.output or ("mesh_game.glb" if args.game_ready else "mesh.glb")
     glb_path  = os.path.join(folder, out_name)
     target_faces = parse_target_faces(args.target_faces)
+    remesh_method = parse_remesh_method(args.remesh_method)
 
     if not os.path.isfile(ply_path):
         err(f"splat.ply not found in {folder}")
@@ -158,6 +173,7 @@ def main():
     ok(f"Device: {device}")
     if args.game_ready:
         ok(f"Game-ready remesh: target={target_faces or 'auto'}")
+        ok(f"Game-ready method: {remesh_method}")
     progress = make_progress(extra_units=1 if args.game_ready else 0)
 
     hdr("LOADING MESH DECODER")
@@ -221,7 +237,7 @@ def main():
     glb = to_glb(
         gs,
         mesh_result,
-        simplify=0.90,           # keep ~10% of faces (smoother geometry than 0.95)
+        simplify=0.50 if args.game_ready and remesh_method == "experimental" else 0.90,
         fill_holes=True,
         fill_holes_resolution=512 if on_mps else 1024,
         fill_holes_num_views=100 if on_mps else 1000,
@@ -230,6 +246,7 @@ def main():
         texture_render_resolution=texture_render_resolution,
         game_remesh=args.game_ready,
         game_target_faces=target_faces,
+        game_remesh_method=remesh_method,
         texture_mode="average",  # smooth angle-weighted multi-view average (no Adam patchiness)
         with_mesh_postprocess=True,   # includes floater removal (remove_floaters default on)
         with_texture_baking=True,

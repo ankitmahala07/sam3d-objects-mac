@@ -151,8 +151,38 @@ def get_export_mode():
         err("Enter a number between 1 and 3.")
 
 
+def get_game_options(export_mode):
+    if export_mode not in ("game", "both"):
+        return "auto", "decimate"
+
+    hdr("STEP 5 — GAME MESH")
+    print(f"  {B}?{RST}  Target face count for the game mesh")
+    print(f"       Examples: 2000 for simple props, 10000 for complex objects")
+    while True:
+        target = ask("Target faces, or auto", "auto").strip().lower()
+        if target == "auto":
+            break
+        if target.isdigit() and int(target) >= 4:
+            break
+        err("Enter auto or a number >= 4.")
+
+    print(f"\n  {B}?{RST}  Game remesh method")
+    print(f"     {G}▶{RST} [1] Existing      ·  stable quadric decimation")
+    print(f"       [2] Experimental  ·  feature-aware retopo, preserves more detail before baking")
+    while True:
+        raw = ask("Enter 1–2", 1)
+        if raw == "1":
+            ok(f"Game mesh: existing method, target={target}")
+            return target, "decimate"
+        if raw == "2":
+            warn("Experimental is automatic feature-aware retopo, not hand-authored quad loops.")
+            ok(f"Game mesh: experimental method, target={target}")
+            return target, "experimental"
+        err("Enter 1 or 2.")
+
+
 # ── full pipeline ─────────────────────────────────────────────────────────────
-def run_pipeline(img_rgb, mask, obj_dir, steps, export_mode):
+def run_pipeline(img_rgb, mask, obj_dir, steps, export_mode, game_target, game_method):
     import torch as _t
 
     hdr("GPU / MEMORY CHECK")
@@ -279,7 +309,10 @@ def run_pipeline(img_rgb, mask, obj_dir, steps, export_mode):
     # the GLB step after this process exits (freeing all CLI memory first).
     if manifest and slat is not None:
         with open(manifest, "a") as _mf:
-            _mf.write(f"{obj_dir}\t{progress.done}\t{progress.total}\t{export_mode}\tauto\n")
+            _mf.write(
+                f"{obj_dir}\t{progress.done}\t{progress.total}\t"
+                f"{export_mode}\t{game_target}\t{game_method}\n"
+            )
     return True
 
 
@@ -292,16 +325,18 @@ def main():
     obj_dir  = get_output_folder()
     steps    = get_steps()
     export_mode = get_export_mode()
+    game_target, game_method = get_game_options(export_mode)
 
     # Always extract: find the largest foreground component with rembg.
     from app import _fg_components
-    hdr("STEP 5 — EXTRACT (rembg)")
+    extract_step = "STEP 6" if export_mode in ("game", "both") else "STEP 5"
+    hdr(f"{extract_step} — EXTRACT (rembg)")
     step("Running rembg foreground detection…")
     comps = _fg_components(img_rgb)
     ok(f"Found {len(comps)} foreground component(s)")
     mask = comps[0] if comps else np.ones(img_rgb.shape[:2], bool)
 
-    run_pipeline(img_rgb, mask, obj_dir, steps, export_mode)
+    run_pipeline(img_rgb, mask, obj_dir, steps, export_mode, game_target, game_method)
     hdr("ALL DONE")
 
 

@@ -372,16 +372,40 @@ def resolve_game_target_faces(face_count, target_faces=None):
     if face_count <= 20000:
         return 2000
     if face_count <= 80000:
-        return 5000
+        return 10000
     return 10000
 
 
-def game_remesh_mesh(
+def normalize_game_remesh_method(method):
+    value = (method or "decimate").lower()
+    if value in ("decimate", "stable", "existing", "quadric"):
+        return "decimate"
+    if value in ("experimental", "retopo", "artist", "feature", "feature-aware"):
+        return "experimental"
+    return "decimate"
+
+
+def _polydata_from_triangles(vertices: np.ndarray, faces: np.ndarray):
+    return pv.PolyData(
+        vertices.astype(np.float64),
+        np.concatenate([np.full((faces.shape[0], 1), 3), faces], axis=1),
+    ).triangulate().clean()
+
+
+def _polydata_to_triangles(mesh):
+    mesh = mesh.triangulate().clean()
+    remesh_vertices = mesh.points.astype(np.float32)
+    remesh_faces = mesh.faces.reshape(-1, 4)[:, 1:].astype(np.int64)
+    return remesh_vertices, remesh_faces
+
+
+def _quadric_game_decimate(
     vertices: np.ndarray,
     faces: np.ndarray,
     target_faces=None,
     boundary_weight: float = 10.0,
     verbose: bool = False,
+    label: str = "Game remesh",
 ):
     import open3d as o3d
 
@@ -389,13 +413,13 @@ def game_remesh_mesh(
     if target >= faces.shape[0]:
         if verbose:
             tqdm.write(
-                f"Game remesh skipped: {faces.shape[0]} faces already <= target {target}"
+                f"{label} skipped: {faces.shape[0]} faces already <= target {target}"
             )
         return vertices, faces
 
     if verbose:
         tqdm.write(
-            f"Game remesh: {vertices.shape[0]} vertices, {faces.shape[0]} faces -> "
+            f"{label}: {vertices.shape[0]} vertices, {faces.shape[0]} faces -> "
             f"target {target} faces"
         )
 
@@ -422,15 +446,118 @@ def game_remesh_mesh(
     remesh_faces = np.asarray(mesh.triangles).astype(np.int64)
     if remesh_vertices.size == 0 or remesh_faces.size == 0:
         if verbose:
-            tqdm.write("Game remesh produced an empty mesh; keeping cleaned mesh")
+            tqdm.write(f"{label} produced an empty mesh; keeping cleaned mesh")
         return vertices, faces
 
     if verbose:
         tqdm.write(
-            f"After game remesh: {remesh_vertices.shape[0]} vertices, "
+            f"After {label.lower()}: {remesh_vertices.shape[0]} vertices, "
             f"{remesh_faces.shape[0]} faces"
         )
     return remesh_vertices, remesh_faces
+
+
+def _experimental_game_retopo(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    target_faces=None,
+    verbose: bool = False,
+):
+    target = resolve_game_target_faces(faces.shape[0], target_faces)
+    if target >= faces.shape[0]:
+        if verbose:
+            tqdm.write(
+                f"Experimental retopo skipped: {faces.shape[0]} faces already <= target {target}"
+            )
+        return vertices, faces
+
+    if verbose:
+        tqdm.write(
+            f"Experimental retopo: {vertices.shape[0]} vertices, {faces.shape[0]} faces -> "
+            f"target {target} faces"
+        )
+
+    try:
+        reduction = 1.0 - (target / max(1, faces.shape[0]))
+        reduction = min(0.98, max(0.0, reduction))
+        mesh = _polydata_from_triangles(vertices, faces)
+        mesh = mesh.compute_normals(
+            cell_normals=True,
+            point_normals=True,
+            split_vertices=False,
+            auto_orient_normals=True,
+            inplace=False,
+        )
+        mesh = mesh.decimate_pro(
+            reduction,
+            feature_angle=30.0,
+            split_angle=60.0,
+            splitting=True,
+            pre_split_mesh=True,
+            preserve_topology=True,
+            boundary_vertex_deletion=False,
+            progress_bar=verbose,
+        )
+        remesh_vertices, remesh_faces = _polydata_to_triangles(mesh)
+    except Exception as exc:
+        if verbose:
+            tqdm.write(
+                f"Experimental retopo failed ({exc}); falling back to stable decimation"
+            )
+        return _quadric_game_decimate(
+            vertices,
+            faces,
+            target_faces=target,
+            boundary_weight=20.0,
+            verbose=verbose,
+            label="Game remesh fallback",
+        )
+
+    if remesh_vertices.size == 0 or remesh_faces.size == 0:
+        if verbose:
+            tqdm.write("Experimental retopo produced an empty mesh; keeping cleaned mesh")
+        return vertices, faces
+
+    if remesh_faces.shape[0] > target:
+        remesh_vertices, remesh_faces = _quadric_game_decimate(
+            remesh_vertices,
+            remesh_faces,
+            target_faces=target,
+            boundary_weight=25.0,
+            verbose=verbose,
+            label="Experimental final limiter",
+        )
+
+    if verbose:
+        tqdm.write(
+            f"After experimental retopo: {remesh_vertices.shape[0]} vertices, "
+            f"{remesh_faces.shape[0]} faces"
+        )
+    return remesh_vertices, remesh_faces
+
+
+def game_remesh_mesh(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    target_faces=None,
+    method: str = "decimate",
+    verbose: bool = False,
+):
+    method = normalize_game_remesh_method(method)
+    if method == "experimental":
+        return _experimental_game_retopo(
+            vertices,
+            faces,
+            target_faces=target_faces,
+            verbose=verbose,
+        )
+
+    return _quadric_game_decimate(
+        vertices,
+        faces,
+        target_faces=target_faces,
+        verbose=verbose,
+    )
 
 
 def parametrize_mesh(vertices: np.array, faces: np.array):
@@ -889,6 +1016,7 @@ def to_glb(
     texture_render_resolution: int = 1024,
     game_remesh: bool = False,
     game_target_faces: Optional[int] = None,
+    game_remesh_method: str = "decimate",
     debug: bool = False,
     verbose: bool = True,
     with_mesh_postprocess=True,
@@ -936,6 +1064,7 @@ def to_glb(
             vertices,
             faces,
             target_faces=game_target_faces,
+            method=game_remesh_method,
             verbose=verbose,
         )
         _emit_progress(progress_callback, "Game remesh", 1)

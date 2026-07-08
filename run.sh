@@ -3,7 +3,7 @@
 #
 #   ./run.sh            image → gaussian splat → chosen textured GLB output
 #   ./run.sh glb <dir>  re-convert one output dir's splat.ply → mesh.glb
-#   ./run.sh game <dir> [faces]  create mesh_game.glb with pre-bake game mesh
+#   ./run.sh game <dir> [faces] [method]  create mesh_game.glb with pre-bake game mesh
 #
 # The full flow runs in two separate processes on purpose: the CLI generates the
 # splat and then EXITS, so macOS reclaims all of its model memory before the GLB
@@ -111,7 +111,11 @@ fi
 # --- game: make a separate game-optimized GLB from an existing splat ------------
 if [[ "$1" == "game" || "$1" == "remesh" ]]; then
     check_models
-    exec "$PY" "$SCRIPT_DIR/ply2glb.py" --game-ready --target-faces "${3:-auto}" "${2:-}"
+    exec "$PY" "$SCRIPT_DIR/ply2glb.py" \
+        --game-ready \
+        --target-faces "${3:-auto}" \
+        --remesh-method "${4:-decimate}" \
+        "${2:-}"
 fi
 
 # Only "", "full" run the full flow; anything else is a mistake — show usage.
@@ -119,7 +123,8 @@ if [[ -n "$1" && "$1" != "full" ]]; then
     echo "Usage:"
     echo "  ./run.sh [full]               image -> gaussian splat -> textured GLB"
     echo "  ./run.sh glb <dir>            re-convert splat.ply -> mesh.glb"
-    echo "  ./run.sh game <dir> [faces]   pre-bake game mesh -> mesh_game.glb"
+    echo "  ./run.sh game <dir> [faces] [method]"
+    echo "                                  pre-bake game mesh -> mesh_game.glb"
     exit 1
 fi
 
@@ -150,16 +155,21 @@ wait_for_memory 12
 echo "──────────────────────────────────────────────"
 echo "  STAGE 2/2 — GLB CONVERSION"
 echo "──────────────────────────────────────────────"
-while IFS=$'\t' read -r objdir progress_done progress_total export_mode game_target; do
+while IFS=$'\t' read -r objdir progress_done progress_total export_mode game_target game_method; do
     [[ -z "$objdir" ]] && continue
     export_mode="${export_mode:-game}"
     game_target="${game_target:-auto}"
+    game_method="${game_method:-decimate}"
     wait_for_memory 12          # cheap if already free; guards multi-object runs
     echo "  → $objdir"
     if [[ "$export_mode" == "game" ]]; then
         SAM3D_PROGRESS_DONE="${progress_done:-0}" \
         SAM3D_PROGRESS_TOTAL="${progress_total:-0}" \
-        "$PY" "$SCRIPT_DIR/ply2glb.py" --game-ready --target-faces "$game_target" "$objdir"
+        "$PY" "$SCRIPT_DIR/ply2glb.py" \
+            --game-ready \
+            --target-faces "$game_target" \
+            --remesh-method "$game_method" \
+            "$objdir"
     elif [[ "$export_mode" == "unoptimised" || "$export_mode" == "unoptimized" ]]; then
         SAM3D_PROGRESS_DONE="${progress_done:-0}" \
         SAM3D_PROGRESS_TOTAL="${progress_total:-0}" \
@@ -168,7 +178,11 @@ while IFS=$'\t' read -r objdir progress_done progress_total export_mode game_tar
         SAM3D_PROGRESS_DONE="${progress_done:-0}" \
         SAM3D_PROGRESS_TOTAL="${progress_total:-0}" \
         SAM3D_PROGRESS_FINISH=0 \
-        "$PY" "$SCRIPT_DIR/ply2glb.py" --game-ready --target-faces "$game_target" "$objdir"
+        "$PY" "$SCRIPT_DIR/ply2glb.py" \
+            --game-ready \
+            --target-faces "$game_target" \
+            --remesh-method "$game_method" \
+            "$objdir"
         next_progress_done=$(( ${progress_done:-0} + 11 ))
         SAM3D_PROGRESS_DONE="$next_progress_done" \
         SAM3D_PROGRESS_TOTAL="${progress_total:-0}" \
