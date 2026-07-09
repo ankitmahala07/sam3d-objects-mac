@@ -79,8 +79,8 @@ def parse_target_faces(raw):
         value = int(raw)
     except ValueError:
         err(f"Invalid target face count: {raw}")
-    if value < 4:
-        err("Target face count must be at least 4.")
+    if value < 500:
+        err("Target face count must be at least 500 for game-quality exports.")
     return value
 
 
@@ -111,12 +111,17 @@ def parse_args():
     parser.add_argument(
         "--target-faces",
         default="auto",
-        help="Target triangle count for --game-ready. Use 'auto' or an integer.",
+        help="Target triangle count for --game-ready. Use 'auto' or an integer >= 500.",
     )
     parser.add_argument(
         "--remesh-method",
         default="decimate",
         help="Game remesh method: decimate (stable) or experimental (feature-aware).",
+    )
+    parser.add_argument(
+        "--strict-face-budget",
+        action="store_true",
+        help="Force the mesh under the requested face count. Can reduce visual quality.",
     )
     parser.add_argument(
         "--output",
@@ -295,6 +300,7 @@ def main():
         game_remesh=args.game_ready,
         game_target_faces=target_faces,
         game_remesh_method=remesh_method,
+        game_strict_faces=args.strict_face_budget,
         texture_mode="average",  # smooth angle-weighted multi-view average (no Adam patchiness)
         with_mesh_postprocess=True,   # includes floater removal (remove_floaters default on)
         with_texture_baking=True,

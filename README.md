@@ -152,6 +152,9 @@ Game remesh methods:
 GLB files are runtime meshes and are stored as triangles. The experimental mode
 tries to produce cleaner automatic topology, but true senior-artist quad loops
 still require a dedicated retopology tool or manual cleanup in a DCC app.
+Targets below 500 faces are rejected to avoid accidentally destroying silhouettes.
+The target is treated as a quality goal; the exporter may keep a little more
+geometry if forcing the exact count would visibly damage the object.
 
 **Re-bake the mesh only** (skips the expensive splat step) from an existing
 `splat.ply` + `slat.pt`:
@@ -167,7 +170,9 @@ still require a dedicated retopology tool or manual cleanup in a DCC app.
 ```
 
 Use `auto` instead of a number to pick a target automatically. Use `decimate`
-instead of `experimental` for the stable existing method.
+instead of `experimental` for the stable existing method. Advanced: pass
+`--strict-face-budget` to `ply2glb.py` only when an exact cap matters more than
+visual quality.
 
 ---
 

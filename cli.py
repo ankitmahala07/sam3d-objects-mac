@@ -162,9 +162,9 @@ def get_game_options(export_mode):
         target = ask("Target faces, or auto", "auto").strip().lower()
         if target == "auto":
             break
-        if target.isdigit() and int(target) >= 4:
+        if target.isdigit() and int(target) >= 500:
             break
-        err("Enter auto or a number >= 4.")
+        err("Enter auto or a number >= 500.")
 
     print(f"\n  {B}?{RST}  Game remesh method")
     print(f"     {G}▶{RST} [1] Existing      ·  stable quadric decimation")

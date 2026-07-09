@@ -366,7 +366,7 @@ def postprocess_mesh(
 
 def resolve_game_target_faces(face_count, target_faces=None):
     if target_faces is not None:
-        return max(4, min(int(target_faces), int(face_count)))
+        return max(500, min(int(target_faces), int(face_count)))
     if face_count <= 2500:
         return int(face_count)
     if face_count <= 20000:
@@ -487,6 +487,7 @@ def _quadric_game_decimate(
     faces: np.ndarray,
     target_faces=None,
     boundary_weight: float = 10.0,
+    strict_faces: bool = False,
     verbose: bool = False,
     label: str = "Game remesh",
 ):
@@ -517,29 +518,20 @@ def _quadric_game_decimate(
     )
     mesh = _clean_open3d_mesh(mesh)
 
-    for _ in range(3):
-        if len(mesh.triangles) <= target:
-            break
-        retry_target = max(4, int(target * 0.85))
-        mesh = mesh.simplify_quadric_decimation(
-            target_number_of_triangles=retry_target,
-            boundary_weight=boundary_weight,
-        )
-        mesh = _clean_open3d_mesh(mesh)
-
     remesh_vertices = np.asarray(mesh.vertices).astype(np.float32)
     remesh_faces = np.asarray(mesh.triangles).astype(np.int64)
     if remesh_vertices.size == 0 or remesh_faces.size == 0:
         if verbose:
             tqdm.write(f"{label} produced an empty mesh; keeping cleaned mesh")
         return vertices, faces
-    remesh_vertices, remesh_faces = _enforce_face_budget(
-        remesh_vertices,
-        remesh_faces,
-        target,
-        verbose=verbose,
-        label=f"{label} hard budget",
-    )
+    if strict_faces:
+        remesh_vertices, remesh_faces = _enforce_face_budget(
+            remesh_vertices,
+            remesh_faces,
+            target,
+            verbose=verbose,
+            label=f"{label} hard budget",
+        )
 
     if verbose:
         tqdm.write(
@@ -553,6 +545,7 @@ def _experimental_game_retopo(
     vertices: np.ndarray,
     faces: np.ndarray,
     target_faces=None,
+    strict_faces: bool = False,
     verbose: bool = False,
 ):
     target = resolve_game_target_faces(faces.shape[0], target_faces)
@@ -602,6 +595,7 @@ def _experimental_game_retopo(
             faces,
             target_faces=target,
             boundary_weight=20.0,
+            strict_faces=strict_faces,
             verbose=verbose,
             label="Game remesh fallback",
         )
@@ -617,16 +611,18 @@ def _experimental_game_retopo(
             remesh_faces,
             target_faces=target,
             boundary_weight=25.0,
+            strict_faces=strict_faces,
             verbose=verbose,
             label="Experimental final limiter",
         )
-    remesh_vertices, remesh_faces = _enforce_face_budget(
-        remesh_vertices,
-        remesh_faces,
-        target,
-        verbose=verbose,
-        label="Experimental hard budget",
-    )
+    if strict_faces:
+        remesh_vertices, remesh_faces = _enforce_face_budget(
+            remesh_vertices,
+            remesh_faces,
+            target,
+            verbose=verbose,
+            label="Experimental hard budget",
+        )
 
     if verbose:
         tqdm.write(
@@ -641,6 +637,7 @@ def game_remesh_mesh(
     faces: np.ndarray,
     target_faces=None,
     method: str = "decimate",
+    strict_faces: bool = False,
     verbose: bool = False,
 ):
     method = normalize_game_remesh_method(method)
@@ -649,6 +646,7 @@ def game_remesh_mesh(
             vertices,
             faces,
             target_faces=target_faces,
+            strict_faces=strict_faces,
             verbose=verbose,
         )
 
@@ -656,6 +654,7 @@ def game_remesh_mesh(
         vertices,
         faces,
         target_faces=target_faces,
+        strict_faces=strict_faces,
         verbose=verbose,
     )
 
@@ -1117,6 +1116,7 @@ def to_glb(
     game_remesh: bool = False,
     game_target_faces: Optional[int] = None,
     game_remesh_method: str = "decimate",
+    game_strict_faces: bool = False,
     debug: bool = False,
     verbose: bool = True,
     with_mesh_postprocess=True,
@@ -1165,6 +1165,7 @@ def to_glb(
             faces,
             target_faces=game_target_faces,
             method=game_remesh_method,
+            strict_faces=game_strict_faces,
             verbose=verbose,
         )
         _emit_progress(progress_callback, "Game remesh", 1)
