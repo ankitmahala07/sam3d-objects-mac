@@ -3,13 +3,15 @@
 SAM-3D Objects — CLI  (Apple Silicon / MPS)
 
 Streamlined full pipeline:
-    1. Ask for an image  (always treated as a raw photo — the background is
-       removed here with rembg, so you never need to pre-extract it)
+    1. Ask for one image, or multiple views of the same object. Images are
+       treated as raw photos — the background is removed here with rembg, so
+       you never need to pre-extract them.
     2. Ask for an output folder name  (created as  ./outputs/<name>/ )
     3. Pick quality and export mode
     4. Run the full 3D pipeline immediately  (voxel → gaussian splat)
 
-Writes  extracted.png, splat.ply, slat.pt  into  outputs/<name>/.
+Writes  extracted.png, optional extracted_view_*.png, splat.ply, slat.pt
+into  outputs/<name>/.
 The textured GLB is produced afterwards by ply2glb.py (see  ./run.sh  →  full flow).
 """
 
@@ -63,24 +65,151 @@ def ask(prompt, default=None):
     return val if val else (str(default) if default is not None else "")
 
 
+def _load_rgb_image(path):
+    path = os.path.expanduser(path.strip().strip("'\""))
+    if not os.path.isfile(path):
+        raise FileNotFoundError(path)
+    img = PILImage.open(path)
+    return path, img, np.array(img.convert("RGB"))
+
+
 # ── prompts ───────────────────────────────────────────────────────────────────
-def get_image():
-    """Ask for an image path. The image is always treated as a raw photo; the
-    background is removed automatically further down (rembg)."""
-    hdr("STEP 1 — IMAGE")
+def get_image_views():
+    """Ask for one image or multiple views. The first view is the primary
+    geometry/depth view; extra views are used as conditioning references."""
+    hdr("STEP 1 — IMAGES")
+    print(f"  {B}?{RST}  Image input")
+    print(f"     {G}▶{RST} [1] Single image")
+    print(f"       [2] Multiple views of the same object")
     while True:
-        path = ask("Image path (drag file here)").strip().strip("'\"")
-        path = os.path.expanduser(path)
-        if not os.path.isfile(path):
-            err(f"File not found: {path}")
-            continue
-        try:
-            img = PILImage.open(path)
-            rgb = np.array(img.convert("RGB"))
-            ok(f"{img.width}×{img.height}  ←  {path}")
-            return rgb
-        except Exception as e:
-            err(f"Could not open: {e}")
+        mode = ask("Enter 1–2", 1)
+        if mode in ("1", "2"):
+            break
+        err("Enter 1 or 2.")
+
+    if mode == "1":
+        while True:
+            path = ask("Image path (drag file here)")
+            try:
+                path, img, rgb = _load_rgb_image(path)
+                ok(f"{img.width}×{img.height}  ←  {path}")
+                return [{"path": path, "rgb": rgb}]
+            except FileNotFoundError:
+                err(f"File not found: {os.path.expanduser(path)}")
+            except Exception as e:
+                err(f"Could not open: {e}")
+
+    while True:
+        raw_count = ask("Number of views", 2).strip()
+        if raw_count.isdigit() and 2 <= int(raw_count) <= 6:
+            view_count = int(raw_count)
+            break
+        err("Enter a number from 2 to 6.")
+
+    views = []
+    print(f"       View 1 is the primary/front view; other views guide conditioning.")
+    for idx in range(view_count):
+        label = "Primary image path" if idx == 0 else f"View {idx + 1} image path"
+        while True:
+            path = ask(label)
+            try:
+                path, img, rgb = _load_rgb_image(path)
+                ok(f"View {idx + 1}: {img.width}×{img.height}  ←  {path}")
+                views.append({"path": path, "rgb": rgb})
+                break
+            except FileNotFoundError:
+                err(f"File not found: {os.path.expanduser(path)}")
+            except Exception as e:
+                err(f"Could not open: {e}")
+    ok(f"{len(views)} view(s) loaded")
+    return views
+
+
+def _extract_masks(image_views):
+    from app import _fg_components
+
+    masks = []
+    for idx, view in enumerate(image_views):
+        comps = _fg_components(view["rgb"])
+        ok(f"View {idx + 1}: found {len(comps)} foreground component(s)")
+        masks.append(comps[0] if comps else np.ones(view["rgb"].shape[:2], bool))
+    return masks
+
+
+def _save_extracted_views(pipeline, image_views, masks, obj_dir):
+    rgba_views = []
+    for idx, (view, mask) in enumerate(zip(image_views, masks)):
+        rgba = pipeline.merge_mask_to_rgba(view["rgb"], mask)
+        rgba_views.append(rgba)
+        filename = "extracted.png" if idx == 0 else f"extracted_view_{idx + 1:02d}.png"
+        out_path = os.path.join(obj_dir, filename)
+        PILImage.fromarray(rgba).save(out_path)
+        saved(filename, out_path)
+    return rgba_views
+
+
+def _write_view_manifest(image_views, obj_dir):
+    if len(image_views) <= 1:
+        return
+    path = os.path.join(obj_dir, "input_views.txt")
+    with open(path, "w") as f:
+        for idx, view in enumerate(image_views, start=1):
+            f.write(f"{idx}\t{view['path']}\n")
+    saved("input_views.txt", path)
+
+
+def _condition_pil_images(rgba_views):
+    return [PILImage.fromarray(rgba) for rgba in rgba_views[1:]]
+
+
+def _primary_pil_image(rgba_views):
+    return PILImage.fromarray(rgba_views[0])
+
+
+def _multi_view_note(image_views):
+    if len(image_views) > 1:
+        ok(f"Multi-view conditioning enabled ({len(image_views)} view(s))")
+    else:
+        ok("Single-image conditioning")
+
+
+def _image_extract_step(export_mode):
+    return "STEP 6" if export_mode in ("game", "both") else "STEP 5"
+
+
+def _run_rembg(image_views, export_mode):
+    hdr(f"{_image_extract_step(export_mode)} — EXTRACT (rembg)")
+    step("Running rembg foreground detection…")
+    return _extract_masks(image_views)
+
+
+def _prepare_views_for_pipeline(pipeline, image_views, masks, obj_dir):
+    rgba_views = _save_extracted_views(pipeline, image_views, masks, obj_dir)
+    _write_view_manifest(image_views, obj_dir)
+    _multi_view_note(image_views)
+    return rgba_views
+
+
+def _validate_views(image_views):
+    if not image_views:
+        raise RuntimeError("No image views loaded.")
+
+
+def _condition_images_for_run(rgba_views):
+    return _condition_pil_images(rgba_views)
+
+
+def _primary_image_for_run(rgba_views):
+    return _primary_pil_image(rgba_views)
+
+
+def _format_run_view_info(image_views):
+    return f"views={len(image_views)}"
+
+
+def _warn_multi_view_cost(image_views):
+    if len(image_views) > 1:
+        warn("Multiple views compute extra depth/condition embeddings; use 2–4 views on 24 GB Macs.")
 
 
 def get_output_folder():
@@ -172,8 +301,10 @@ def get_game_options(export_mode):
 
 
 # ── full pipeline ─────────────────────────────────────────────────────────────
-def run_pipeline(img_rgb, mask, obj_dir, steps, export_mode, game_target, game_method):
+def run_pipeline(image_views, masks, obj_dir, steps, export_mode, game_target, game_method):
     import torch as _t
+
+    _validate_views(image_views)
 
     hdr("GPU / MEMORY CHECK")
     try:
@@ -200,16 +331,16 @@ def run_pipeline(img_rgb, mask, obj_dir, steps, export_mode, game_target, game_m
     ok(f"Using seed {seed}")
 
     hdr("OBJECT")
-    rgba = pipeline.merge_mask_to_rgba(img_rgb, mask)
-    p_ext = os.path.join(obj_dir, "extracted.png")
-    PILImage.fromarray(rgba).save(p_ext)
-    saved("extracted.png", p_ext)
+    _warn_multi_view_cost(image_views)
+    rgba_views = _prepare_views_for_pipeline(pipeline, image_views, masks, obj_dir)
+    primary_image = _primary_image_for_run(rgba_views)
+    condition_images = _condition_images_for_run(rgba_views)
 
     # Single attempt only. fp16 diffusion on MPS can overflow to NaN under memory
     # pressure; we detect it and refuse to write a dead splat, but we do NOT retry
     # in-process — the prior attempt's ~15 GB stays allocated and a second run hits a
     # hard Metal allocation crash. Retry by re-running as a fresh process.
-    step(f"Running  (steps={steps}  seed={seed})…")
+    step(f"Running  (steps={steps}  seed={seed}  {_format_run_view_info(image_views)})…")
     import gc
     gc.collect()
     if _t.backends.mps.is_available():
@@ -221,10 +352,11 @@ def run_pipeline(img_rgb, mask, obj_dir, steps, export_mode, game_target, game_m
     progress = CliProgress(total=splat_progress_units + glb_progress_units)
     try:
         output = pipeline._pipeline.run(
-            PILImage.fromarray(rgba),
+            primary_image,
             seed=seed,
             stage1_inference_steps=steps,
             stage2_inference_steps=steps,
+            condition_images=condition_images,
             decode_formats=["gaussian"],   # skip mesh decoder entirely (ply2glb does it)
             # Single-shot run: free each stage's models before the next stage
             # allocates. Frees stage-1 models before SLAT and moves finished
@@ -311,22 +443,17 @@ def main():
     print(f"\n{BOLD}{M}  SAM-3D Objects  ·  CLI{RST}")
     print(f"{DIM}  Apple Silicon / MPS  ·  rembg + gaussian splat{RST}")
 
-    img_rgb  = get_image()
-    obj_dir  = get_output_folder()
-    steps    = get_steps()
+    image_views = get_image_views()
+    obj_dir = get_output_folder()
+    steps = get_steps()
     export_mode = get_export_mode()
     game_target, game_method = get_game_options(export_mode)
 
-    # Always extract: find the largest foreground component with rembg.
-    from app import _fg_components
-    extract_step = "STEP 6" if export_mode in ("game", "both") else "STEP 5"
-    hdr(f"{extract_step} — EXTRACT (rembg)")
-    step("Running rembg foreground detection…")
-    comps = _fg_components(img_rgb)
-    ok(f"Found {len(comps)} foreground component(s)")
-    mask = comps[0] if comps else np.ones(img_rgb.shape[:2], bool)
+    # Always extract every supplied view: find the largest foreground component
+    # with rembg, then merge that mask into RGBA before generation.
+    masks = _run_rembg(image_views, export_mode)
 
-    run_pipeline(img_rgb, mask, obj_dir, steps, export_mode, game_target, game_method)
+    run_pipeline(image_views, masks, obj_dir, steps, export_mode, game_target, game_method)
     hdr("ALL DONE")
 
 

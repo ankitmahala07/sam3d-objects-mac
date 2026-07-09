@@ -709,6 +709,75 @@ def _enforce_single_open3d_component(mesh, verbose=False, label="Game mesh singl
     return mesh
 
 
+def _enforce_single_edge_component(mesh, verbose=False, label="Game mesh edge-connected body"):
+    if os.environ.get("SAM3D_GAME_EDGE_SINGLE_COMPONENT", "1").strip().lower() in ("0", "false", "no", "off"):
+        return mesh
+
+    vertices = np.asarray(mesh.vertices)
+    triangles = np.asarray(mesh.triangles)
+    if vertices.size == 0 or triangles.shape[0] == 0:
+        return mesh
+
+    tri_mesh = trimesh.Trimesh(vertices=vertices, faces=triangles, process=False)
+    components = tri_mesh.split(only_watertight=False)
+    if len(components) <= 1:
+        return mesh
+
+    keep = max(components, key=lambda component: len(component.faces))
+    removed_faces = int(sum(len(component.faces) for component in components) - len(keep.faces))
+    if removed_faces <= 0:
+        return mesh
+
+    out = _open3d_mesh_from_arrays(np.asarray(keep.vertices), np.asarray(keep.faces))
+    if verbose:
+        tqdm.write(
+            f"{label}: removed {len(components) - 1:,} edge-disconnected component(s) "
+            f"({removed_faces:,} faces)"
+        )
+    return out
+
+
+def _mesh_slenderness(mesh):
+    vertices = np.asarray(mesh.vertices)
+    if vertices.size == 0:
+        return 1.0
+    extent = np.sort(vertices.max(axis=0) - vertices.min(axis=0))
+    return float(extent[-1] / max(extent[-2], 1e-6))
+
+
+def _refine_slender_open3d_mesh(mesh, verbose=False, label="Game mesh slender refinement"):
+    if os.environ.get("SAM3D_GAME_REFINE_SLENDER", "1").strip().lower() in ("0", "false", "no", "off"):
+        return mesh
+
+    face_count = int(np.asarray(mesh.triangles).shape[0])
+    if face_count == 0:
+        return mesh
+
+    slenderness = _mesh_slenderness(mesh)
+    threshold = float(os.environ.get("SAM3D_GAME_SLENDER_THRESHOLD", "5.0"))
+    min_faces = int(os.environ.get("SAM3D_GAME_SLENDER_MIN_FACES", "8000"))
+    max_faces = int(os.environ.get("SAM3D_GAME_SLENDER_MAX_FACES", "12000"))
+    if slenderness < threshold or face_count >= min_faces:
+        return mesh
+
+    refined = mesh.subdivide_midpoint(number_of_iterations=1)
+    refined = _clean_open3d_mesh(refined)
+    refined_faces = int(np.asarray(refined.triangles).shape[0])
+    if refined_faces > max_faces:
+        refined = refined.simplify_quadric_decimation(
+            target_number_of_triangles=max_faces,
+            boundary_weight=20.0,
+        )
+        refined = _clean_open3d_mesh(refined)
+
+    if verbose:
+        tqdm.write(
+            f"{label}: long thin object detected "
+            f"(slenderness={slenderness:.2f}); {face_count:,}->{len(refined.triangles):,} faces"
+        )
+    return refined
+
+
 def _collapse_skinny_open3d_triangles(mesh, verbose=False, label="Game mesh sliver cleanup"):
     if os.environ.get("SAM3D_GAME_COLLAPSE_SLIVERS", "1").strip().lower() in ("0", "false", "no", "off"):
         return mesh
@@ -854,6 +923,8 @@ def _quality_preserve_game_mesh(
         mesh = _snap_near_surface_components(mesh, verbose=verbose)
         mesh = _drop_unresolved_tiny_open3d_components(mesh, verbose=verbose)
         mesh = _enforce_single_open3d_component(mesh, verbose=verbose)
+        mesh = _refine_slender_open3d_mesh(mesh, verbose=verbose)
+        mesh = _enforce_single_open3d_component(mesh, verbose=verbose)
         mesh = _collapse_skinny_open3d_triangles(mesh, verbose=verbose)
         mesh = _enforce_single_open3d_component(mesh, verbose=verbose)
         mesh = _weld_close_open3d_vertices(mesh, verbose=verbose, label="Final game weld")
@@ -862,6 +933,7 @@ def _quality_preserve_game_mesh(
             mesh, verbose=verbose, label="Final game sliver cleanup"
         )
         mesh = _enforce_single_open3d_component(mesh, verbose=verbose)
+        mesh = _enforce_single_edge_component(mesh, verbose=verbose)
         out_vertices = np.asarray(mesh.vertices, dtype=np.float32)
         out_faces = np.asarray(mesh.triangles, dtype=np.int64)
         if verbose:
@@ -887,6 +959,8 @@ def _quality_preserve_game_mesh(
     mesh = _snap_near_surface_components(mesh, verbose=verbose)
     mesh = _drop_unresolved_tiny_open3d_components(mesh, verbose=verbose)
     mesh = _enforce_single_open3d_component(mesh, verbose=verbose)
+    mesh = _refine_slender_open3d_mesh(mesh, verbose=verbose)
+    mesh = _enforce_single_open3d_component(mesh, verbose=verbose)
     mesh = _collapse_skinny_open3d_triangles(mesh, verbose=verbose)
     mesh = _enforce_single_open3d_component(mesh, verbose=verbose)
     mesh = _weld_close_open3d_vertices(mesh, verbose=verbose, label="Final game weld")
@@ -895,6 +969,7 @@ def _quality_preserve_game_mesh(
         mesh, verbose=verbose, label="Final game sliver cleanup"
     )
     mesh = _enforce_single_open3d_component(mesh, verbose=verbose)
+    mesh = _enforce_single_edge_component(mesh, verbose=verbose)
 
     out_vertices = np.asarray(mesh.vertices, dtype=np.float32)
     out_faces = np.asarray(mesh.triangles, dtype=np.int64)

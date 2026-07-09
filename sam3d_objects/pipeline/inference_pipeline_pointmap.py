@@ -446,6 +446,7 @@ class InferencePipelinePointMap(InferencePipeline):
         fail_on_nan=False,
         return_pointmap=True,
         return_latents=True,
+        condition_images=None,
         progress_callback=None,
     ) -> dict:
         def emit_progress(event, **payload):
@@ -467,6 +468,10 @@ class InferencePipelinePointMap(InferencePipeline):
             return _callback
 
         image = self.merge_image_and_mask(image, mask)
+        condition_images = [
+            self.merge_image_and_mask(condition_image, None)
+            for condition_image in (condition_images or [])
+        ]
         with self.device: 
             emit_progress("phase", label="Depth pointmap")
             pointmap_dict = self.compute_pointmap(image, pointmap)
@@ -488,6 +493,30 @@ class InferencePipelinePointMap(InferencePipeline):
             ss_input_dict = self.preprocess_image(
                 image, self.ss_preprocessor, pointmap=pointmap
             )
+            if condition_images:
+                emit_progress("phase", label="Multi-view condition")
+                ss_condition_dicts = [ss_input_dict]
+                for condition_image in condition_images:
+                    condition_pointmap_dict = self.compute_pointmap(condition_image)
+                    condition_pointmap = condition_pointmap_dict["pointmap"]
+                    ss_condition_dicts.append(
+                        self.preprocess_image(
+                            condition_image,
+                            self.ss_preprocessor,
+                            pointmap=condition_pointmap,
+                        )
+                    )
+                    del condition_pointmap_dict, condition_pointmap
+                self._ensure_condition_embedder("ss_condition_embedder")
+                ss_condition = self.average_condition_embedding(
+                    self.condition_embedders["ss_condition_embedder"],
+                    ss_condition_dicts,
+                    self.ss_condition_input_mapping,
+                    label="Stage 1 multi-view",
+                )
+                if ss_condition is not None:
+                    ss_input_dict["_condition_embedding"] = ss_condition
+                del ss_condition_dicts
             emit_progress("advance", label="Depth + image prep", amount=1)
             # MoGe depth model is only used by compute_pointmap above.
             if free_stage_models and not estimate_plane:
@@ -544,6 +573,22 @@ class InferencePipelinePointMap(InferencePipeline):
                 )
             emit_progress("phase", label="Stage 2 setup")
             slat_input_dict = self.preprocess_image(image, self.slat_preprocessor)
+            if condition_images:
+                slat_condition_dicts = [slat_input_dict]
+                for condition_image in condition_images:
+                    slat_condition_dicts.append(
+                        self.preprocess_image(condition_image, self.slat_preprocessor)
+                    )
+                self._ensure_condition_embedder("slat_condition_embedder")
+                slat_condition = self.average_condition_embedding(
+                    self.condition_embedders["slat_condition_embedder"],
+                    slat_condition_dicts,
+                    self.slat_condition_input_mapping,
+                    label="Stage 2 multi-view",
+                )
+                if slat_condition is not None:
+                    slat_input_dict["_condition_embedding"] = slat_condition
+                del slat_condition_dicts
             emit_progress("advance", label="Stage 2 setup", amount=1)
             emit_progress("phase", label="Stage 2 latent diffusion")
             slat = self.sample_slat(

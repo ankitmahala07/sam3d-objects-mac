@@ -115,11 +115,13 @@ checkpoints/hf/checkpoints/
 ./run.sh
 ```
 
-That's the whole thing. It asks for the source image, output folder, quality,
+That's the whole thing. It asks for the source image(s), output folder, quality,
 and GLB output mode, then runs end to end:
 
-1. **Image path** — any ordinary photo. The background is removed automatically
-   (rembg); you do **not** need to pre-extract the object.
+1. **Images** — choose either a single ordinary photo or multiple views of the
+   same object. The first view is the primary geometry/depth view; the other
+   views are extra conditioning references. The background is removed
+   automatically (rembg); you do **not** need to pre-extract the object.
 2. **Output folder name** — results are written to `outputs/<name>/`.
 3. **Quality** — diffusion steps for both stages:
    `Low = 10` (default), `Medium = 25`, `High = 50`, or a custom value.
@@ -133,10 +135,17 @@ Output in `outputs/<name>/`:
 | File            | What it is                                             |
 |-----------------|--------------------------------------------------------|
 | `extracted.png` | the object with background removed (RGBA)              |
+| `extracted_view_02.png`, ... | optional extracted reference views        |
+| `input_views.txt` | optional manifest of the supplied view paths          |
 | `splat.ply`     | the raw gaussian splat                                 |
 | `slat.pt`       | the sparse latent (input to the mesh decoder)          |
 | `mesh_game.glb` | optional/default game-oriented low-poly textured mesh  |
 | `mesh.glb`      | optional unoptimised high-detail textured mesh         |
+
+Multiple views are experimental and memory-sensitive. View 1 drives depth and
+pose; all supplied views are averaged into the Stage 1 and Stage 2 condition
+embeddings before generation. Extra views add depth and conditioning work, so
+2-4 views is the practical range on a 24 GB Mac.
 
 The `Game` export builds a quality-safe welded mesh before UV unwrap and texture
 baking, so the texture is baked directly onto the exported game asset. The face
@@ -146,9 +155,11 @@ Moderate decoded meshes are pre-cleaned before the game reduction, then close
 seams and near-surface fragments are welded into the main mesh on CPU before
 baking. The final game mesh is forced to a single connected body; only unresolved
 leftovers are discarded after the weld attempt. A final sliver pass collapses
-extreme skinny triangles at tips before UV unwrap and texture baking. Very large
-decoded meshes skip the pre-clean step to avoid the MPS-heavy cleanup that can
-crash on million-face assets.
+extreme skinny triangles at tips before UV unwrap and texture baking. Long,
+thin props such as spears can keep extra subdivisions when the requested target
+would leave visibly stretched faces. Very large decoded meshes skip the
+pre-clean step to avoid the MPS-heavy cleanup that can crash on million-face
+assets.
 `Both` creates `mesh_game.glb` first and then `mesh.glb` for side-by-side
 comparison.
 
