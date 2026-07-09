@@ -105,12 +105,14 @@ wait_for_memory() {
 # --- glb: re-convert an existing splat -----------------------------------------
 if [[ "$1" == "glb" ]]; then
     check_models
+    wait_for_memory 12
     exec "$PY" "$SCRIPT_DIR/ply2glb.py" "${2:-}"
 fi
 
 # --- game: make a separate game-optimized GLB from an existing splat ------------
 if [[ "$1" == "game" || "$1" == "remesh" ]]; then
     check_models
+    wait_for_memory 12
     exec "$PY" "$SCRIPT_DIR/ply2glb.py" \
         --game-ready \
         --target-faces "${3:-auto}" \

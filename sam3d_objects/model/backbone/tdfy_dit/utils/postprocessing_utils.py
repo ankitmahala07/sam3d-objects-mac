@@ -392,11 +392,94 @@ def _polydata_from_triangles(vertices: np.ndarray, faces: np.ndarray):
     ).triangulate().clean()
 
 
+def _triangle_only_polydata(mesh):
+    mesh = mesh.copy()
+    mesh.clear_data()
+    mesh = mesh.extract_surface(
+        pass_pointid=False,
+        pass_cellid=False,
+        algorithm="dataset_surface",
+    ).triangulate().clean()
+    raw = np.asarray(mesh.faces)
+    if raw.size == 0:
+        return pv.PolyData(mesh.points)
+
+    triangles = []
+    i = 0
+    while i < raw.size:
+        n = int(raw[i])
+        face = raw[i + 1 : i + 1 + n]
+        if n == 3:
+            triangles.append(face)
+        i += n + 1
+
+    if not triangles:
+        return pv.PolyData(mesh.points)
+
+    faces = np.asarray(triangles, dtype=np.int64)
+    return _polydata_from_triangles(mesh.points, faces)
+
+
 def _polydata_to_triangles(mesh):
-    mesh = mesh.triangulate().clean()
+    mesh = _triangle_only_polydata(mesh)
     remesh_vertices = mesh.points.astype(np.float32)
     remesh_faces = mesh.faces.reshape(-1, 4)[:, 1:].astype(np.int64)
     return remesh_vertices, remesh_faces
+
+
+def _clean_open3d_mesh(mesh):
+    mesh.remove_duplicated_vertices()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_degenerate_triangles()
+    mesh.remove_non_manifold_edges()
+    mesh.remove_unreferenced_vertices()
+    mesh.compute_vertex_normals()
+    return mesh
+
+
+def _enforce_face_budget(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    target: int,
+    verbose: bool = False,
+    label: str = "Final face budget",
+):
+    if target >= faces.shape[0]:
+        return vertices, faces
+
+    best_vertices, best_faces = vertices, faces
+    for _ in range(4):
+        if best_faces.shape[0] <= target:
+            break
+        reduction = 1.0 - (target / max(1, best_faces.shape[0]))
+        reduction = min(0.99, max(0.0, reduction))
+        if reduction <= 0:
+            break
+        try:
+            mesh = _polydata_from_triangles(best_vertices, best_faces)
+            mesh = mesh.decimate(
+                reduction,
+                volume_preservation=True,
+                boundary_constraints=True,
+                boundary_weight=20.0,
+                progress_bar=False,
+            )
+            cand_vertices, cand_faces = _polydata_to_triangles(mesh)
+        except Exception as exc:
+            if verbose:
+                tqdm.write(f"{label} failed ({exc}); keeping previous mesh")
+            break
+
+        if cand_faces.size == 0 or cand_faces.shape[0] >= best_faces.shape[0]:
+            break
+        best_vertices, best_faces = cand_vertices, cand_faces
+
+    if verbose and best_faces.shape[0] != faces.shape[0]:
+        tqdm.write(
+            f"{label}: {vertices.shape[0]} vertices, {faces.shape[0]} faces -> "
+            f"{best_vertices.shape[0]} vertices, {best_faces.shape[0]} faces"
+        )
+    return best_vertices, best_faces
 
 
 def _quadric_game_decimate(
@@ -426,21 +509,23 @@ def _quadric_game_decimate(
     mesh = o3d.geometry.TriangleMesh()
     mesh.vertices = o3d.utility.Vector3dVector(vertices.astype(np.float64))
     mesh.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
-    mesh.remove_duplicated_vertices()
-    mesh.remove_duplicated_triangles()
-    mesh.remove_degenerate_triangles()
-    mesh.remove_unreferenced_vertices()
+    mesh = _clean_open3d_mesh(mesh)
 
     mesh = mesh.simplify_quadric_decimation(
         target_number_of_triangles=target,
         boundary_weight=boundary_weight,
     )
-    mesh.remove_duplicated_vertices()
-    mesh.remove_duplicated_triangles()
-    mesh.remove_degenerate_triangles()
-    mesh.remove_non_manifold_edges()
-    mesh.remove_unreferenced_vertices()
-    mesh.compute_vertex_normals()
+    mesh = _clean_open3d_mesh(mesh)
+
+    for _ in range(3):
+        if len(mesh.triangles) <= target:
+            break
+        retry_target = max(4, int(target * 0.85))
+        mesh = mesh.simplify_quadric_decimation(
+            target_number_of_triangles=retry_target,
+            boundary_weight=boundary_weight,
+        )
+        mesh = _clean_open3d_mesh(mesh)
 
     remesh_vertices = np.asarray(mesh.vertices).astype(np.float32)
     remesh_faces = np.asarray(mesh.triangles).astype(np.int64)
@@ -448,6 +533,13 @@ def _quadric_game_decimate(
         if verbose:
             tqdm.write(f"{label} produced an empty mesh; keeping cleaned mesh")
         return vertices, faces
+    remesh_vertices, remesh_faces = _enforce_face_budget(
+        remesh_vertices,
+        remesh_faces,
+        target,
+        verbose=verbose,
+        label=f"{label} hard budget",
+    )
 
     if verbose:
         tqdm.write(
@@ -488,6 +580,7 @@ def _experimental_game_retopo(
             auto_orient_normals=True,
             inplace=False,
         )
+        mesh = _triangle_only_polydata(mesh)
         mesh = mesh.decimate_pro(
             reduction,
             feature_angle=30.0,
@@ -527,6 +620,13 @@ def _experimental_game_retopo(
             verbose=verbose,
             label="Experimental final limiter",
         )
+    remesh_vertices, remesh_faces = _enforce_face_budget(
+        remesh_vertices,
+        remesh_faces,
+        target,
+        verbose=verbose,
+        label="Experimental hard budget",
+    )
 
     if verbose:
         tqdm.write(

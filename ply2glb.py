@@ -12,7 +12,7 @@ Loads only the mesh decoder (~500 MB), not the full inference pipeline.
 Requires slat.pt and splat.ply to exist in <output_folder>.
 """
 
-import sys, os, time, argparse
+import sys, os, time, argparse, gc
 import torch
 import numpy as np
 from sam3d_progress import CliProgress
@@ -47,6 +47,21 @@ def bool_env(name, default=True):
     if raw is None:
         return default
     return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def choose_mesh_decode_device(render_device, active_voxels):
+    requested = os.environ.get("SAM3D_MESH_DECODE_DEVICE", "auto").strip().lower()
+    if requested in ("cpu", "mps", "cuda"):
+        if requested == "mps" and not torch.backends.mps.is_available():
+            return render_device, "requested mps is unavailable"
+        if requested == "cuda" and not torch.cuda.is_available():
+            return render_device, "requested cuda is unavailable"
+        return requested, f"forced by SAM3D_MESH_DECODE_DEVICE={requested}"
+
+    cpu_threshold = int_env("SAM3D_CPU_DECODE_VOXELS", 30000)
+    if torch.device(render_device).type == "mps" and active_voxels >= cpu_threshold:
+        return "cpu", f"large SLAT ({active_voxels:,} voxels >= {cpu_threshold:,})"
+    return render_device, "auto"
 
 
 def make_progress(extra_units=0):
@@ -147,6 +162,22 @@ def load_mesh_decoder(device):
     return model
 
 
+def empty_device_cache(device):
+    device_type = torch.device(device).type
+    if device_type == "mps" and hasattr(torch, "mps"):
+        torch.mps.empty_cache()
+    elif device_type == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def move_mesh_result_to_cpu(mesh_result):
+    for name in ("vertices", "faces", "vertex_attrs", "face_normal"):
+        value = getattr(mesh_result, name, None)
+        if isinstance(value, torch.Tensor):
+            setattr(mesh_result, name, value.detach().cpu())
+    return mesh_result
+
+
 def main():
     print(f"\n{BOLD}{W}  ply2glb  ·  Gaussian splat → Textured GLB{RST}")
     args = parse_args()
@@ -168,57 +199,74 @@ def main():
     if not os.path.isfile(slat_path):
         err(f"slat.pt not found in {folder} — re-run the CLI to regenerate (it now saves slat.pt)")
 
-    device = "mps" if torch.backends.mps.is_available() and not torch.cuda.is_available() else \
-             "cuda" if torch.cuda.is_available() else "cpu"
-    ok(f"Device: {device}")
+    render_device = (
+        "mps" if torch.backends.mps.is_available() and not torch.cuda.is_available()
+        else "cuda" if torch.cuda.is_available()
+        else "cpu"
+    )
+    ok(f"Device: {render_device}")
     if args.game_ready:
         ok(f"Game-ready remesh: target={target_faces or 'auto'}")
         ok(f"Game-ready method: {remesh_method}")
     progress = make_progress(extra_units=1 if args.game_ready else 0)
 
+    hdr("LOADING ASSETS")
+    progress("phase", label="Load GLB assets")
+    step("Loading sparse latent (slat.pt) on CPU…")
+    slat = load_slat(slat_path)
+    ok(f"SLAT: {slat.feats.shape[0]:,} active voxels")
+
+    # Guard: a non-finite latent would produce garbage geometry.
+    if not bool(torch.isfinite(slat.feats).all().detach().cpu().item()):
+        progress.close()
+        err("slat.pt contains NaN/Inf (failed generation). "
+            "Re-run the CLI to regenerate this object before converting to GLB.")
+    progress.advance("Load GLB assets", 1)
+
+    decode_device, decode_reason = choose_mesh_decode_device(render_device, slat.feats.shape[0])
+    ok(f"Mesh decode device: {decode_device} ({decode_reason})")
+
     hdr("LOADING MESH DECODER")
     progress("phase", label="Load mesh decoder")
     step("Loading slat_decoder_mesh (~500 MB)…")
     t0 = time.time()
-    decoder = load_mesh_decoder(device)
+    decoder = load_mesh_decoder(decode_device)
     progress.advance("Load mesh decoder", 1)
     ok(f"Mesh decoder ready  ({time.time()-t0:.1f}s)")
-
-    hdr("LOADING ASSETS")
-    progress("phase", label="Load GLB assets")
-    step("Loading sparse latent (slat.pt)…")
-    slat = load_slat(slat_path).to(device)
-    ok(f"SLAT: {slat.feats.shape[0]:,} active voxels")
-
-    step("Loading gaussian (splat.ply)…")
-    gs = load_gaussian(ply_path, device)
-    ok(f"Gaussian: {gs.get_xyz.shape[0]:,} splats")
-
-    # Guard: a non-finite splat would produce garbage geometry.
-    if (
-        not bool(torch.isfinite(gs.get_xyz).all().detach().cpu().item())
-        or not bool(torch.isfinite(slat.feats).all().detach().cpu().item())
-    ):
-        progress.close()
-        err("splat.ply / slat.pt contain NaN/Inf (failed generation). "
-            "Re-run the CLI to regenerate this object before converting to GLB.")
-    progress.advance("Load GLB assets", 1)
 
     hdr("DECODING MESH")
     progress("phase", label="Decode mesh")
     step("Running mesh decoder…")
     t0 = time.time()
+    slat_decode = slat.to(decode_device)
     with torch.no_grad():
-        mesh_result = decoder(slat)[0]
+        mesh_result = decoder(slat_decode)[0]
+    mesh_result = move_mesh_result_to_cpu(mesh_result)
     progress.advance("Decode mesh", 2)
     ok(f"Mesh decoded  ({time.time()-t0:.1f}s)  — {mesh_result.vertices.shape[0]:,} verts / {mesh_result.faces.shape[0]:,} faces")
+
+    del decoder, slat, slat_decode
+    gc.collect()
+    empty_device_cache(decode_device)
+    ok("Released mesh decoder memory before loading gaussian splats")
+
+    hdr("LOADING GAUSSIAN")
+    progress("phase", label="Load gaussian")
+    step("Loading gaussian (splat.ply)…")
+    gs = load_gaussian(ply_path, render_device)
+    ok(f"Gaussian: {gs.get_xyz.shape[0]:,} splats")
+
+    if not bool(torch.isfinite(gs.get_xyz).all().detach().cpu().item()):
+        progress.close()
+        err("splat.ply contains NaN/Inf (failed generation). "
+            "Re-run the CLI to regenerate this object before converting to GLB.")
 
     hdr("CLEANUP MESH + BAKE TEXTURE + EXPORT GLB")
     progress("phase", label="Cleanup + texture bake")
     t0 = time.time()
     from sam3d_objects.model.backbone.tdfy_dit.utils.postprocessing_utils import to_glb
     import torch as _t
-    on_mps = _t.backends.mps.is_available() and not _t.cuda.is_available()
+    on_mps = torch.device(render_device).type == "mps"
     texture_views = int_env("SAM3D_TEXTURE_VIEWS", 100)
     texture_render_resolution = int_env("SAM3D_TEXTURE_RENDER_RES", 1024)
     texture_size = int_env("SAM3D_TEXTURE_SIZE", 2048)

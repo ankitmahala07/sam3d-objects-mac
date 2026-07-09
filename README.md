@@ -216,6 +216,17 @@ sparse-structure model before Stage 2, the SLAT model before decoding. This
 lowers the peak enough to run on smaller Macs; still use **Low (10 steps)** on
 24 GB and close other apps first.
 
+**Large-object mesh decode fallback.** If a generated object has a very large
+`slat.pt`, the fp32 mesh decoder may still exceed MPS memory. GLB conversion now
+automatically decodes large SLATs on CPU, frees the decoder, then loads gaussian
+splats back on MPS for texture baking. This is slower but avoids the macOS
+`killed` failure during `DECODING MESH`. Override with:
+
+```bash
+SAM3D_MESH_DECODE_DEVICE=mps ./run.sh game outputs/<name> 1600 experimental
+SAM3D_CPU_DECODE_VOXELS=50000 ./run.sh game outputs/<name> 1600 experimental
+```
+
 ---
 
 ## How it works
