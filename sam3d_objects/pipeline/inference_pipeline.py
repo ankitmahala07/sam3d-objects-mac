@@ -759,51 +759,81 @@ class InferencePipeline:
 
         return condition_args, condition_kwargs
 
-    def _stack_condition_dicts(self, input_dicts):
-        stacked = {}
-        for key in input_dicts[0]:
-            if key.startswith("_"):
-                continue
-            values = [item.get(key) for item in input_dicts]
-            if not all(isinstance(value, torch.Tensor) for value in values):
-                continue
-            shapes = [tuple(value.shape[1:]) for value in values]
-            if any(shape != shapes[0] for shape in shapes):
-                continue
-            stacked[key] = torch.cat(values, dim=0)
-        return stacked
-
     def average_condition_embedding(
         self,
         condition_embedder,
         input_dicts,
         input_mapping,
         label="multi-view",
+        view_count=None,
+        autocast_dtype=None,
     ):
-        if condition_embedder is None or len(input_dicts) <= 1:
+        if condition_embedder is None:
             return None
 
-        stacked_input = self._stack_condition_dicts(input_dicts)
-        if not stacked_input:
+        if view_count is None:
+            try:
+                view_count = len(input_dicts)
+            except TypeError:
+                view_count = None
+        if view_count is not None and view_count <= 1:
             return None
-        condition_args = self.map_input_keys(stacked_input, input_mapping)
-        condition_kwargs = {
-            k: v
-            for k, v in stacked_input.items()
-            if k not in input_mapping and not k.startswith("_")
-        }
+
         logger.info(
-            "Running {} condition embedder for {} view(s) ...",
+            "Running {} condition embedder sequentially for {} view(s) ...",
             label,
-            len(input_dicts),
+            view_count if view_count is not None else "multiple",
         )
-        embedded_cond, _, _ = self.embed_condition(
-            condition_embedder, *condition_args, **condition_kwargs
-        )
-        logger.info("{} condition embedder finishes!", label)
-        if embedded_cond is None or not isinstance(embedded_cond, torch.Tensor):
+
+        import contextlib
+
+        if autocast_dtype is not None and self.device.type != "cpu":
+            autocast_ctx = torch.autocast(
+                device_type=self.device.type,
+                dtype=autocast_dtype,
+            )
+        else:
+            autocast_ctx = contextlib.nullcontext()
+
+        running = None
+        expected_shape = None
+        count = 0
+        with torch.no_grad():
+            with autocast_ctx:
+                for input_dict in input_dicts:
+                    condition_args = self.map_input_keys(input_dict, input_mapping)
+                    condition_kwargs = {
+                        k: v
+                        for k, v in input_dict.items()
+                        if k not in input_mapping and not k.startswith("_")
+                    }
+                    embedded_cond, _, _ = self.embed_condition(
+                        condition_embedder, *condition_args, **condition_kwargs
+                    )
+                    if embedded_cond is None or not isinstance(embedded_cond, torch.Tensor):
+                        return None
+
+                    embedded_cond = embedded_cond.detach()
+                    if expected_shape is None:
+                        expected_shape = tuple(embedded_cond.shape)
+                        running = embedded_cond.clone()
+                    elif tuple(embedded_cond.shape) != expected_shape:
+                        return None
+                    else:
+                        running.add_(embedded_cond)
+                    count += 1
+
+                    del embedded_cond, condition_args, condition_kwargs
+                    if self.device.type == "mps" and hasattr(torch, "mps"):
+                        torch.mps.empty_cache()
+                    elif self.device.type == "cuda" and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+        if running is None or count == 0:
             return None
-        return embedded_cond.mean(dim=0, keepdim=True).contiguous()
+
+        logger.info("{} condition embedder finishes!", label)
+        return (running / count).contiguous()
 
     def _call_generator_with_progress(self, generator, progress_callback, *args, **kwargs):
         if progress_callback is None:

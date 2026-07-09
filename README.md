@@ -144,8 +144,9 @@ Output in `outputs/<name>/`:
 
 Multiple views are experimental and memory-sensitive. View 1 drives depth and
 pose; all supplied views are averaged into the Stage 1 and Stage 2 condition
-embeddings before generation. Extra views add depth and conditioning work, so
-2-4 views is the practical range on a 24 GB Mac.
+embeddings before generation. Extra views are streamed through the condition
+embedders one at a time to avoid a batch-size memory spike, but they still add
+depth and conditioning work, so 2-4 views is the practical range on a 24 GB Mac.
 
 The `Game` export builds a quality-safe welded mesh before UV unwrap and texture
 baking, so the texture is baked directly onto the exported game asset. The face

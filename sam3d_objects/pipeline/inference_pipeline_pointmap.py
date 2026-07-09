@@ -494,29 +494,34 @@ class InferencePipelinePointMap(InferencePipeline):
                 image, self.ss_preprocessor, pointmap=pointmap
             )
             if condition_images:
-                emit_progress("phase", label="Multi-view condition")
-                ss_condition_dicts = [ss_input_dict]
-                for condition_image in condition_images:
-                    condition_pointmap_dict = self.compute_pointmap(condition_image)
-                    condition_pointmap = condition_pointmap_dict["pointmap"]
-                    ss_condition_dicts.append(
-                        self.preprocess_image(
+                view_count = len(condition_images) + 1
+                emit_progress("phase", label=f"Multi-view condition ({view_count} views)")
+
+                def ss_condition_inputs():
+                    yield ss_input_dict
+                    for condition_image in condition_images:
+                        condition_pointmap_dict = self.compute_pointmap(condition_image)
+                        condition_pointmap = condition_pointmap_dict["pointmap"]
+                        condition_input = self.preprocess_image(
                             condition_image,
                             self.ss_preprocessor,
                             pointmap=condition_pointmap,
                         )
-                    )
-                    del condition_pointmap_dict, condition_pointmap
+                        del condition_pointmap_dict, condition_pointmap
+                        yield condition_input
+                        del condition_input
+
                 self._ensure_condition_embedder("ss_condition_embedder")
                 ss_condition = self.average_condition_embedding(
                     self.condition_embedders["ss_condition_embedder"],
-                    ss_condition_dicts,
+                    ss_condition_inputs(),
                     self.ss_condition_input_mapping,
                     label="Stage 1 multi-view",
+                    view_count=view_count,
+                    autocast_dtype=self.shape_model_dtype,
                 )
                 if ss_condition is not None:
                     ss_input_dict["_condition_embedding"] = ss_condition
-                del ss_condition_dicts
             emit_progress("advance", label="Depth + image prep", amount=1)
             # MoGe depth model is only used by compute_pointmap above.
             if free_stage_models and not estimate_plane:
@@ -574,21 +579,28 @@ class InferencePipelinePointMap(InferencePipeline):
             emit_progress("phase", label="Stage 2 setup")
             slat_input_dict = self.preprocess_image(image, self.slat_preprocessor)
             if condition_images:
-                slat_condition_dicts = [slat_input_dict]
-                for condition_image in condition_images:
-                    slat_condition_dicts.append(
-                        self.preprocess_image(condition_image, self.slat_preprocessor)
-                    )
+                view_count = len(condition_images) + 1
+
+                def slat_condition_inputs():
+                    yield slat_input_dict
+                    for condition_image in condition_images:
+                        condition_input = self.preprocess_image(
+                            condition_image, self.slat_preprocessor
+                        )
+                        yield condition_input
+                        del condition_input
+
                 self._ensure_condition_embedder("slat_condition_embedder")
                 slat_condition = self.average_condition_embedding(
                     self.condition_embedders["slat_condition_embedder"],
-                    slat_condition_dicts,
+                    slat_condition_inputs(),
                     self.slat_condition_input_mapping,
                     label="Stage 2 multi-view",
+                    view_count=view_count,
+                    autocast_dtype=self.dtype,
                 )
                 if slat_condition is not None:
                     slat_input_dict["_condition_embedding"] = slat_condition
-                del slat_condition_dicts
             emit_progress("advance", label="Stage 2 setup", amount=1)
             emit_progress("phase", label="Stage 2 latent diffusion")
             slat = self.sample_slat(
