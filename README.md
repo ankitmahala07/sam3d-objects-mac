@@ -145,9 +145,10 @@ keep more faces when a low target would damage the silhouette or texture bake.
 Moderate decoded meshes are pre-cleaned before the game reduction, then close
 seams and near-surface fragments are welded into the main mesh on CPU before
 baking. The final game mesh is forced to a single connected body; only unresolved
-leftovers are discarded after the weld attempt. Very large decoded meshes skip
-the pre-clean step to avoid the MPS-heavy cleanup that can crash on million-face
-assets.
+leftovers are discarded after the weld attempt. A final sliver pass collapses
+extreme skinny triangles at tips before UV unwrap and texture baking. Very large
+decoded meshes skip the pre-clean step to avoid the MPS-heavy cleanup that can
+crash on million-face assets.
 `Both` creates `mesh_game.glb` first and then `mesh.glb` for side-by-side
 comparison.
 

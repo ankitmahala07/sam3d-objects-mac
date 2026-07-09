@@ -709,6 +709,120 @@ def _enforce_single_open3d_component(mesh, verbose=False, label="Game mesh singl
     return mesh
 
 
+def _collapse_skinny_open3d_triangles(mesh, verbose=False, label="Game mesh sliver cleanup"):
+    if os.environ.get("SAM3D_GAME_COLLAPSE_SLIVERS", "1").strip().lower() in ("0", "false", "no", "off"):
+        return mesh
+
+    triangles = np.asarray(mesh.triangles)
+    if triangles.shape[0] == 0:
+        return mesh
+
+    aspect_limit = float(os.environ.get("SAM3D_GAME_SLIVER_ASPECT", "30"))
+    edge_frac = float(os.environ.get("SAM3D_GAME_SLIVER_EDGE_FRAC", "0.004"))
+    edge_mult = float(os.environ.get("SAM3D_GAME_SLIVER_EDGE_MULT", "0.25"))
+    max_passes = max(1, int(os.environ.get("SAM3D_GAME_SLIVER_PASSES", "2")))
+    edge_pairs = np.asarray([[0, 1], [1, 2], [2, 0]], dtype=np.int64)
+    total_collapsed = 0
+    last_short_limit = 0.0
+
+    for _ in range(max_passes):
+        vertices = np.asarray(mesh.vertices)
+        triangles = np.asarray(mesh.triangles)
+        if vertices.size == 0 or triangles.size == 0:
+            break
+
+        tri_vertices = vertices[triangles]
+        edge_lengths = np.stack(
+            [
+                np.linalg.norm(tri_vertices[:, 1] - tri_vertices[:, 0], axis=1),
+                np.linalg.norm(tri_vertices[:, 2] - tri_vertices[:, 1], axis=1),
+                np.linalg.norm(tri_vertices[:, 0] - tri_vertices[:, 2], axis=1),
+            ],
+            axis=1,
+        )
+        area = 0.5 * np.linalg.norm(
+            np.cross(
+                tri_vertices[:, 1] - tri_vertices[:, 0],
+                tri_vertices[:, 2] - tri_vertices[:, 0],
+            ),
+            axis=1,
+        )
+        longest = edge_lengths.max(axis=1)
+        height = np.divide(
+            2.0 * area,
+            longest,
+            out=np.zeros_like(area),
+            where=longest > 0,
+        )
+        aspect = np.divide(
+            longest,
+            height,
+            out=np.full_like(area, np.inf),
+            where=height > 0,
+        )
+
+        positive_edges = edge_lengths[edge_lengths > 0]
+        if positive_edges.size == 0:
+            break
+        median_edge = float(np.median(positive_edges))
+        short_limit = min(_mesh_scale(mesh) * edge_frac, median_edge * edge_mult)
+        last_short_limit = short_limit
+
+        candidates = np.nonzero(
+            np.isfinite(aspect)
+            & (aspect >= aspect_limit)
+            & (edge_lengths.min(axis=1) <= short_limit)
+        )[0]
+        if candidates.size == 0:
+            break
+
+        parent = np.arange(vertices.shape[0], dtype=np.int64)
+
+        def find(vertex_idx):
+            while parent[vertex_idx] != vertex_idx:
+                parent[vertex_idx] = parent[parent[vertex_idx]]
+                vertex_idx = parent[vertex_idx]
+            return vertex_idx
+
+        def union(a, b):
+            root_a = find(int(a))
+            root_b = find(int(b))
+            if root_a != root_b:
+                parent[root_b] = root_a
+
+        for tri_idx in candidates:
+            shortest_edge = int(np.argmin(edge_lengths[tri_idx]))
+            a, b = triangles[tri_idx, edge_pairs[shortest_edge]]
+            union(a, b)
+
+        roots = np.asarray([find(i) for i in range(vertices.shape[0])], dtype=np.int64)
+        _, inverse = np.unique(roots, return_inverse=True)
+        new_vertices = np.zeros((int(inverse.max()) + 1, 3), dtype=np.float64)
+        counts = np.zeros(new_vertices.shape[0], dtype=np.float64)
+        np.add.at(new_vertices, inverse, vertices)
+        np.add.at(counts, inverse, 1.0)
+        new_vertices /= counts[:, None]
+
+        new_triangles = inverse[triangles]
+        valid = (
+            (new_triangles[:, 0] != new_triangles[:, 1])
+            & (new_triangles[:, 1] != new_triangles[:, 2])
+            & (new_triangles[:, 2] != new_triangles[:, 0])
+        )
+        if not bool(valid.any()):
+            break
+
+        mesh = _open3d_mesh_from_arrays(new_vertices, new_triangles[valid])
+        total_collapsed += int(candidates.size)
+
+    if verbose and total_collapsed:
+        tqdm.write(
+            f"{label}: collapsed {total_collapsed:,} skinny triangle(s) "
+            f"(aspect>={aspect_limit:g}, short_edge<={last_short_limit:.5f})"
+        )
+    return mesh
+
+
 def _smooth_open3d_game_mesh(mesh, verbose=False):
     iterations = int(os.environ.get("SAM3D_GAME_SMOOTH_ITERS", "1"))
     if iterations <= 0 or np.asarray(mesh.triangles).shape[0] == 0:
@@ -740,8 +854,14 @@ def _quality_preserve_game_mesh(
         mesh = _snap_near_surface_components(mesh, verbose=verbose)
         mesh = _drop_unresolved_tiny_open3d_components(mesh, verbose=verbose)
         mesh = _enforce_single_open3d_component(mesh, verbose=verbose)
+        mesh = _collapse_skinny_open3d_triangles(mesh, verbose=verbose)
+        mesh = _enforce_single_open3d_component(mesh, verbose=verbose)
         mesh = _weld_close_open3d_vertices(mesh, verbose=verbose, label="Final game weld")
         mesh = _smooth_open3d_game_mesh(mesh, verbose=verbose)
+        mesh = _collapse_skinny_open3d_triangles(
+            mesh, verbose=verbose, label="Final game sliver cleanup"
+        )
+        mesh = _enforce_single_open3d_component(mesh, verbose=verbose)
         out_vertices = np.asarray(mesh.vertices, dtype=np.float32)
         out_faces = np.asarray(mesh.triangles, dtype=np.int64)
         if verbose:
@@ -767,8 +887,14 @@ def _quality_preserve_game_mesh(
     mesh = _snap_near_surface_components(mesh, verbose=verbose)
     mesh = _drop_unresolved_tiny_open3d_components(mesh, verbose=verbose)
     mesh = _enforce_single_open3d_component(mesh, verbose=verbose)
+    mesh = _collapse_skinny_open3d_triangles(mesh, verbose=verbose)
+    mesh = _enforce_single_open3d_component(mesh, verbose=verbose)
     mesh = _weld_close_open3d_vertices(mesh, verbose=verbose, label="Final game weld")
     mesh = _smooth_open3d_game_mesh(mesh, verbose=verbose)
+    mesh = _collapse_skinny_open3d_triangles(
+        mesh, verbose=verbose, label="Final game sliver cleanup"
+    )
+    mesh = _enforce_single_open3d_component(mesh, verbose=verbose)
 
     out_vertices = np.asarray(mesh.vertices, dtype=np.float32)
     out_faces = np.asarray(mesh.triangles, dtype=np.int64)
