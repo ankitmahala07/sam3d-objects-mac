@@ -1,5 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 from typing import *
+import os
 import numpy as np
 import torch
 import utils3d
@@ -415,6 +416,70 @@ def _resolve_quality_game_target(face_count, target_faces=None):
     return int(min(face_count, max(requested, min(target, 80_000))))
 
 
+def _clean_open3d_mesh(mesh):
+    mesh.remove_duplicated_vertices()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_degenerate_triangles()
+    mesh.remove_unreferenced_vertices()
+    mesh.compute_vertex_normals()
+    return mesh
+
+
+def _prune_small_open3d_components(mesh, verbose=False, label="Game mesh cleanup"):
+    triangles = np.asarray(mesh.triangles)
+    if triangles.shape[0] == 0:
+        return mesh
+
+    clusters, cluster_n_triangles, cluster_area = mesh.cluster_connected_triangles()
+    cluster_n_triangles = np.asarray(cluster_n_triangles)
+    cluster_area = np.asarray(cluster_area)
+    if cluster_n_triangles.size <= 1:
+        return mesh
+
+    clusters = np.asarray(clusters)
+    largest_faces = int(cluster_n_triangles.max())
+    largest_area = float(cluster_area.max()) if cluster_area.size else 0.0
+    min_faces_default = max(
+        12,
+        int(largest_faces * 0.03),
+        int(triangles.shape[0] * 0.0002),
+    )
+    min_faces = int(os.environ.get("SAM3D_GAME_MIN_COMPONENT_FACES", min_faces_default))
+    min_area_frac = float(os.environ.get("SAM3D_GAME_MIN_COMPONENT_AREA_FRAC", "0.003"))
+    min_area = largest_area * min_area_frac
+
+    keep_components = (cluster_n_triangles >= min_faces) | (cluster_area >= min_area)
+    if not bool(keep_components.any()):
+        keep_components[int(cluster_n_triangles.argmax())] = True
+
+    remove_triangle_mask = ~keep_components[clusters]
+    removed_faces = int(remove_triangle_mask.sum())
+    removed_components = int((~keep_components).sum())
+    if removed_faces == 0:
+        return mesh
+
+    mesh.remove_triangles_by_mask(remove_triangle_mask.tolist())
+    mesh = _clean_open3d_mesh(mesh)
+    if verbose:
+        tqdm.write(
+            f"{label}: removed {removed_components:,}/{cluster_n_triangles.size:,} "
+            f"tiny components ({removed_faces:,} faces; min_faces={min_faces}, "
+            f"min_area_frac={min_area_frac:g})"
+        )
+    return mesh
+
+
+def _smooth_open3d_game_mesh(mesh, verbose=False):
+    iterations = int(os.environ.get("SAM3D_GAME_SMOOTH_ITERS", "1"))
+    if iterations <= 0 or np.asarray(mesh.triangles).shape[0] == 0:
+        return mesh
+    mesh = mesh.filter_smooth_taubin(number_of_iterations=iterations)
+    mesh = _clean_open3d_mesh(mesh)
+    if verbose:
+        tqdm.write(f"Game mesh smoothing: Taubin iterations={iterations}")
+    return mesh
+
+
 def _quality_preserve_game_mesh(
     vertices: np.ndarray,
     faces: np.ndarray,
@@ -423,39 +488,39 @@ def _quality_preserve_game_mesh(
 ):
     import open3d as o3d
 
-    target = _resolve_quality_game_target(faces.shape[0], target_faces)
-    if target >= faces.shape[0]:
-        if verbose:
-            tqdm.write(
-                f"Quality game mesh kept source geometry: {faces.shape[0]:,} faces"
-            )
-        return vertices.astype(np.float32), faces.astype(np.int64)
-
-    if verbose:
-        requested = resolve_game_target_faces(faces.shape[0], target_faces)
-        tqdm.write(
-            "Quality game mesh: "
-            f"{vertices.shape[0]:,} vertices / {faces.shape[0]:,} faces -> "
-            f"~{target:,} faces (requested {requested:,}; preserving silhouette)"
-        )
-
     mesh = o3d.geometry.TriangleMesh()
     mesh.vertices = o3d.utility.Vector3dVector(vertices.astype(np.float64))
     mesh.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
-    mesh.remove_duplicated_vertices()
-    mesh.remove_duplicated_triangles()
-    mesh.remove_degenerate_triangles()
-    mesh.remove_unreferenced_vertices()
-    mesh.compute_vertex_normals()
+    mesh = _clean_open3d_mesh(mesh)
+    mesh = _prune_small_open3d_components(mesh, verbose=verbose, label="Source game cleanup")
+
+    source_faces = int(np.asarray(mesh.triangles).shape[0])
+    target = _resolve_quality_game_target(source_faces, target_faces)
+    if target >= source_faces:
+        mesh = _smooth_open3d_game_mesh(mesh, verbose=verbose)
+        out_vertices = np.asarray(mesh.vertices, dtype=np.float32)
+        out_faces = np.asarray(mesh.triangles, dtype=np.int64)
+        if verbose:
+            tqdm.write(
+                f"Quality game mesh kept source geometry: {out_faces.shape[0]:,} faces"
+            )
+        return out_vertices, out_faces
+
+    if verbose:
+        requested = resolve_game_target_faces(source_faces, target_faces)
+        tqdm.write(
+            "Quality game mesh: "
+            f"{np.asarray(mesh.vertices).shape[0]:,} vertices / {source_faces:,} faces -> "
+            f"~{target:,} faces (requested {requested:,}; preserving silhouette)"
+        )
+
     mesh = mesh.simplify_quadric_decimation(
         target_number_of_triangles=target,
         boundary_weight=20.0,
     )
-    mesh.remove_duplicated_vertices()
-    mesh.remove_duplicated_triangles()
-    mesh.remove_degenerate_triangles()
-    mesh.remove_unreferenced_vertices()
-    mesh.compute_vertex_normals()
+    mesh = _clean_open3d_mesh(mesh)
+    mesh = _prune_small_open3d_components(mesh, verbose=verbose, label="Final game cleanup")
+    mesh = _smooth_open3d_game_mesh(mesh, verbose=verbose)
 
     out_vertices = np.asarray(mesh.vertices, dtype=np.float32)
     out_faces = np.asarray(mesh.triangles, dtype=np.int64)

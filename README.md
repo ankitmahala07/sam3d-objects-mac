@@ -142,6 +142,9 @@ The `Game` export builds a quality-safe mesh before UV unwrap and texture
 baking, so the texture is baked directly onto the exported game asset. The face
 target is treated as a quality hint, not a hard destructive cap: the exporter may
 keep more faces when a low target would damage the silhouette or texture bake.
+Tiny disconnected mesh islands are pruned on CPU before baking, and a light
+Taubin smoothing pass removes small surface spikes without the MPS-heavy cleanup
+that can crash on million-face decoded meshes.
 `Both` creates `mesh_game.glb` first and then `mesh.glb` for side-by-side
 comparison.
 
