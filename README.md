@@ -146,7 +146,9 @@ texture is baked directly onto the rebuilt lower-poly asset. `Both` creates
 Game retopo uses the repo's native surface-net retopo backend. It is
 intentionally not a triangle reduction pass: it samples the generated surface as
 an object-aligned signed-distance field, rebuilds it as clean quad-style
-topology, then bakes the generated texture onto that mesh.
+topology, then bakes the generated texture onto that mesh. Game exports run this
+retopo before the MPS-heavy visibility cleanup, so million-triangle decoded
+meshes are reduced on CPU before texture baking.
 
 GLB files are runtime meshes and are stored as triangles. For topology
 inspection/editing, use `mesh_game_retopo.obj`; that sidecar is saved before

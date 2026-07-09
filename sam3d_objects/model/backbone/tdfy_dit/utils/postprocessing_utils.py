@@ -318,6 +318,15 @@ def postprocess_mesh(
             )
 
     # Remove invisible faces
+    if fill_holes and _dev == "mps" and faces.shape[0] > 300_000:
+        if verbose:
+            tqdm.write(
+                "Skipping MPS visibility cleanup for large mesh "
+                f"({faces.shape[0]:,} faces); this pass can request excessive "
+                "Metal memory. Retopo/game exports rebuild topology separately."
+            )
+        fill_holes = False
+
     if fill_holes:
         vertices, faces = (
             torch.tensor(vertices).to(_dev),
@@ -342,6 +351,14 @@ def postprocess_mesh(
     # Drop small disconnected pieces ("floaters"): cleanup + mincut can leave dozens
     # of tiny islands. Keep only components with at least floater_frac of the largest
     # component's face count (with a small absolute floor).
+    if remove_floaters and _dev == "mps" and faces.shape[0] > 300_000:
+        if verbose:
+            tqdm.write(
+                "Skipping MPS floater cleanup for large mesh "
+                f"({faces.shape[0]:,} faces); keeping the mesh on the CPU path."
+            )
+        remove_floaters = False
+
     if remove_floaters:
         ft = torch.tensor(faces.astype(np.int64), device=_dev)
         vt = torch.tensor(vertices, device=_dev).float()
@@ -909,7 +926,26 @@ def to_glb(
     faces = mesh.faces.cpu().numpy()
     vert_colors = mesh.vertex_attrs[:, :3].cpu().numpy()
 
-    if with_mesh_postprocess:
+    if game_remesh:
+        if with_mesh_postprocess:
+            if verbose:
+                tqdm.write(
+                    "Skipping heavy pre-retopo mesh cleanup for game export; "
+                    "native retopo rebuilds the source mesh on CPU first."
+                )
+            _emit_progress(progress_callback, "Skip pre-retopo cleanup", 1)
+
+        vertices, faces = game_remesh_mesh(
+            vertices,
+            faces,
+            target_faces=game_target_faces,
+            method=game_remesh_method,
+            retopo_output_path=game_retopo_sidecar_path,
+            verbose=verbose,
+        )
+        _emit_progress(progress_callback, "Game remesh", 1)
+
+    elif with_mesh_postprocess:
         # mesh postprocess
         vertices, faces = postprocess_mesh(
             vertices,
@@ -925,17 +961,6 @@ def to_glb(
             verbose=verbose,
         )
         _emit_progress(progress_callback, "Mesh cleanup", 1)
-
-    if game_remesh:
-        vertices, faces = game_remesh_mesh(
-            vertices,
-            faces,
-            target_faces=game_target_faces,
-            method=game_remesh_method,
-            retopo_output_path=game_retopo_sidecar_path,
-            verbose=verbose,
-        )
-        _emit_progress(progress_callback, "Game remesh", 1)
 
     if with_texture_baking:
         # parametrize mesh

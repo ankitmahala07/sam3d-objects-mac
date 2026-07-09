@@ -271,7 +271,7 @@ def main():
     texture_size = int_env("SAM3D_TEXTURE_SIZE", 2048)
     if on_mps:
         step(
-            ("Mesh cleanup → retopo → streamed texture bake " if args.game_ready else "Mesh cleanup → streamed texture bake ")
+            ("Native retopo → streamed texture bake " if args.game_ready else "Mesh cleanup → streamed texture bake ")
             + f"({texture_views} views @ {texture_render_resolution}px, {texture_size}px atlas)…"
         )
     else:
