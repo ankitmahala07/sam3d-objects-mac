@@ -7,4 +7,8 @@ _kaolin_install()
 
 # Allow skipping initialization for lightweight tools
 if not os.environ.get('LIDRA_SKIP_INIT'):
-    import sam3d_objects.init
+    try:
+        import sam3d_objects.init
+    except ModuleNotFoundError as exc:
+        if exc.name != "sam3d_objects.init":
+            raise

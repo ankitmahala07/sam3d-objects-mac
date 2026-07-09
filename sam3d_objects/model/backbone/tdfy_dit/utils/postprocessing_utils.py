@@ -1,10 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 from typing import *
-import os
-import shutil
-import subprocess
-import tempfile
-import textwrap
 import numpy as np
 import torch
 import utils3d
@@ -381,156 +376,34 @@ def resolve_game_target_faces(face_count, target_faces=None):
     return 10000
 
 
-def find_blender_executable():
-    env_path = os.environ.get("SAM3D_BLENDER")
-    candidates = [
-        env_path,
-        shutil.which("blender"),
-        "/Applications/Blender.app/Contents/MacOS/Blender",
-        "/opt/homebrew/bin/blender",
-        "/usr/local/bin/blender",
-    ]
-    for path in candidates:
-        if path and os.path.isfile(path) and os.access(path, os.X_OK):
-            return path
-    return None
-
-
 def normalize_game_remesh_method(method):
     value = (method or "retopo").lower()
-    if value in ("retopo", "quadriflow", "blender"):
+    if value in ("retopo", "native", "sam3d", "surface-net", "surfacenet"):
         return "retopo"
     raise RuntimeError("Game export only supports true retopo now. Use retopo.")
 
 
-def _load_mesh_arrays(path):
-    loaded = trimesh.load(path, force="scene", process=False)
-    if isinstance(loaded, trimesh.Scene):
-        meshes = [
-            geom for geom in loaded.geometry.values()
-            if hasattr(geom, "vertices") and hasattr(geom, "faces")
-        ]
-        if not meshes:
-            raise RuntimeError("Retopo backend produced no mesh geometry")
-        mesh = trimesh.util.concatenate(meshes)
-    else:
-        mesh = loaded
-    vertices = np.asarray(mesh.vertices, dtype=np.float32)
-    faces = np.asarray(mesh.faces, dtype=np.int64)
-    if vertices.size == 0 or faces.size == 0:
-        raise RuntimeError("Retopo backend produced an empty mesh")
-    return vertices, faces
-
-
-def _blender_quadriflow_retopo(
+def _native_surface_net_retopo(
     vertices: np.ndarray,
     faces: np.ndarray,
     target_faces=None,
     retopo_output_path: Optional[str] = None,
     verbose: bool = False,
 ):
-    blender = find_blender_executable()
-    if not blender:
-        raise RuntimeError(
-            "Game retopo requires Blender QuadriFlow. Install Blender or set "
-            "SAM3D_BLENDER=/path/to/Blender."
-        )
+    from sam3d_objects.retopo import retopologize, write_quad_obj
 
     target = resolve_game_target_faces(faces.shape[0], target_faces)
-    quad_target = max(250, int(round(target / 2)))
+    result = retopologize(vertices, faces, target_faces=target, verbose=verbose)
+    if retopo_output_path:
+        write_quad_obj(retopo_output_path, result.vertices, result.quads)
+        if verbose:
+            tqdm.write(f"Saved retopo source mesh: {retopo_output_path}")
     if verbose:
         tqdm.write(
-            f"Blender QuadriFlow retopo: {vertices.shape[0]} vertices, "
-            f"{faces.shape[0]} triangles -> ~{quad_target} quads "
-            f"(~{target} GLB triangles)"
+            f"After native retopo: {result.vertices.shape[0]} vertices, "
+            f"{result.quads.shape[0]} quads / {result.faces.shape[0]} triangles"
         )
-
-    with tempfile.TemporaryDirectory(prefix="sam3d_retopo_") as tmp:
-        src_path = os.path.join(tmp, "source.obj")
-        dst_path = os.path.join(tmp, "retopo.obj")
-        script_path = os.path.join(tmp, "retopo.py")
-
-        trimesh.Trimesh(vertices=vertices, faces=faces, process=False).export(src_path)
-        script = textwrap.dedent(
-            f"""
-            import bpy
-            import sys
-
-            source = {src_path!r}
-            dest = {dst_path!r}
-            target_quads = {quad_target}
-
-            bpy.ops.wm.read_factory_settings(use_empty=True)
-
-            try:
-                bpy.ops.wm.obj_import(filepath=source)
-            except Exception:
-                bpy.ops.import_scene.obj(filepath=source)
-
-            meshes = [obj for obj in bpy.context.scene.objects if obj.type == 'MESH']
-            if not meshes:
-                print('No mesh imported', file=sys.stderr)
-                raise SystemExit(2)
-
-            bpy.ops.object.select_all(action='DESELECT')
-            for obj in meshes:
-                obj.select_set(True)
-            bpy.context.view_layer.objects.active = meshes[0]
-            if len(meshes) > 1:
-                bpy.ops.object.join()
-
-            obj = bpy.context.view_layer.objects.active
-            obj.select_set(True)
-            bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
-
-            bpy.ops.object.quadriflow_remesh(
-                use_mesh_symmetry=False,
-                use_preserve_sharp=True,
-                use_preserve_boundary=True,
-                preserve_attributes=False,
-                smooth_normals=True,
-                mode='FACES',
-                target_faces=target_quads,
-                seed=0,
-            )
-
-            bpy.ops.object.select_all(action='DESELECT')
-            bpy.context.view_layer.objects.active.select_set(True)
-            try:
-                bpy.ops.wm.obj_export(filepath=dest, export_selected_objects=True)
-            except Exception:
-                bpy.ops.export_scene.obj(filepath=dest, use_selection=True)
-            """
-        )
-        with open(script_path, "w") as f:
-            f.write(script)
-
-        proc = subprocess.run(
-            [blender, "--background", "--factory-startup", "--python", script_path],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        if proc.returncode != 0 or not os.path.exists(dst_path):
-            detail = (proc.stderr or proc.stdout).strip()[-2000:]
-            raise RuntimeError(f"Blender QuadriFlow retopo failed: {detail}")
-
-        if retopo_output_path:
-            out_dir = os.path.dirname(os.path.abspath(retopo_output_path))
-            if out_dir:
-                os.makedirs(out_dir, exist_ok=True)
-            shutil.copyfile(dst_path, retopo_output_path)
-            if verbose:
-                tqdm.write(f"Saved retopo source mesh: {retopo_output_path}")
-
-        retopo_vertices, retopo_faces = _load_mesh_arrays(dst_path)
-
-    if verbose:
-        tqdm.write(
-            f"After Blender QuadriFlow retopo: {retopo_vertices.shape[0]} vertices, "
-            f"{retopo_faces.shape[0]} triangles"
-        )
-    return retopo_vertices, retopo_faces
+    return result.vertices, result.faces
 
 
 def game_remesh_mesh(
@@ -543,7 +416,7 @@ def game_remesh_mesh(
 ):
     method = normalize_game_remesh_method(method)
     if method == "retopo":
-        return _blender_quadriflow_retopo(
+        return _native_surface_net_retopo(
             vertices,
             faces,
             target_faces=target_faces,

@@ -12,7 +12,7 @@ Loads only the mesh decoder (~500 MB), not the full inference pipeline.
 Requires slat.pt and splat.ply to exist in <output_folder>.
 """
 
-import sys, os, time, argparse, gc, shutil
+import sys, os, time, argparse, gc
 import torch
 import numpy as np
 from sam3d_progress import CliProgress
@@ -86,24 +86,9 @@ def parse_target_faces(raw):
 
 def parse_remesh_method(raw):
     value = (raw or "retopo").strip().lower()
-    if value in ("retopo", "quadriflow", "blender"):
+    if value in ("retopo", "native", "sam3d", "surface-net", "surfacenet"):
         return "retopo"
     err("Game export only supports true retopo now. Use retopo.")
-
-
-def find_blender_executable():
-    env_path = os.environ.get("SAM3D_BLENDER")
-    candidates = [
-        env_path,
-        shutil.which("blender"),
-        "/Applications/Blender.app/Contents/MacOS/Blender",
-        "/opt/homebrew/bin/blender",
-        "/usr/local/bin/blender",
-    ]
-    for path in candidates:
-        if path and os.path.isfile(path) and os.access(path, os.X_OK):
-            return path
-    return None
 
 
 def parse_args():
@@ -129,7 +114,7 @@ def parse_args():
     parser.add_argument(
         "--remesh-method",
         default="retopo",
-        help="Game mesh method. Only true retopo is supported.",
+        help="Game mesh method. Uses the native surface-net retopo backend.",
     )
     parser.add_argument(
         "--output",
@@ -221,15 +206,7 @@ def main():
     ok(f"Device: {render_device}")
     if args.game_ready:
         ok(f"Game-ready remesh: target={target_faces or 'auto'}")
-        ok(f"Game-ready method: retopo")
-        blender_path = find_blender_executable()
-        if not blender_path:
-            err(
-                "Game retopo requires Blender QuadriFlow, but Blender was not found. "
-                "Install Blender or set SAM3D_BLENDER=/path/to/Blender. "
-                "Use './run.sh glb <dir>' for an unoptimised GLB without retopo."
-            )
-        ok(f"Retopo backend: Blender QuadriFlow ({blender_path})")
+        ok("Game-ready method: native surface-net retopo")
     progress = make_progress(extra_units=1 if args.game_ready else 0)
 
     hdr("LOADING ASSETS")

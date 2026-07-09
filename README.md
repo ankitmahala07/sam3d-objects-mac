@@ -143,16 +143,18 @@ The `Game` export retopologizes before UV unwrap and texture baking, so the
 texture is baked directly onto the rebuilt lower-poly asset. `Both` creates
 `mesh_game.glb` first and then `mesh.glb` for side-by-side comparison.
 
-Game retopo uses Blender QuadriFlow, so Blender must be installed or pointed to
-with `SAM3D_BLENDER=/path/to/Blender`. This is intentionally not a triangle
-reduction pass: it rebuilds the surface into cleaner quad-style topology first,
-then bakes the generated texture onto that mesh.
+Game retopo uses the repo's native surface-net retopo backend. It is
+intentionally not a triangle reduction pass: it samples the generated surface as
+an object-aligned signed-distance field, rebuilds it as clean quad-style
+topology, then bakes the generated texture onto that mesh.
 
 GLB files are runtime meshes and are stored as triangles. For topology
 inspection/editing, use `mesh_game_retopo.obj`; that sidecar is saved before
-texture baking. Targets below 500 faces are rejected to avoid accidentally
-destroying silhouettes, and the target is treated as an approximate final GLB
-triangle budget because the source retopo mesh is quad-based before export.
+texture baking. Flat/simple regions receive larger grid faces at lower targets,
+while raising the target gives curved and detailed regions more cells. Targets
+below 500 faces are rejected to avoid accidentally destroying silhouettes, and
+the target is treated as an approximate final GLB triangle budget because the
+source retopo mesh is quad-based before export.
 
 **Re-bake the mesh only** (skips the expensive splat step) from an existing
 `splat.ply` + `slat.pt`:
