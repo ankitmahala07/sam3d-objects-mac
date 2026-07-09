@@ -416,6 +416,14 @@ def _resolve_quality_game_target(face_count, target_faces=None):
     return int(min(face_count, max(requested, min(target, 80_000))))
 
 
+def _game_preclean_limit():
+    return int(os.environ.get("SAM3D_GAME_PRECLEAN_MAX_FACES", "250000"))
+
+
+def _game_preclean_simplify_ratio():
+    return float(os.environ.get("SAM3D_GAME_PRECLEAN_SIMPLIFY_RATIO", "0.90"))
+
+
 def _clean_open3d_mesh(mesh):
     mesh.remove_duplicated_vertices()
     mesh.remove_duplicated_triangles()
@@ -670,6 +678,37 @@ def _drop_unresolved_tiny_open3d_components(mesh, verbose=False, label="Game mes
     return mesh
 
 
+def _enforce_single_open3d_component(mesh, verbose=False, label="Game mesh single body"):
+    if os.environ.get("SAM3D_GAME_SINGLE_COMPONENT", "1").strip().lower() in ("0", "false", "no", "off"):
+        return mesh
+
+    triangles = np.asarray(mesh.triangles)
+    if triangles.shape[0] == 0:
+        return mesh
+
+    clusters, cluster_n_triangles, _ = mesh.cluster_connected_triangles()
+    cluster_n_triangles = np.asarray(cluster_n_triangles)
+    if cluster_n_triangles.size <= 1:
+        return mesh
+
+    clusters = np.asarray(clusters)
+    keep_component = int(cluster_n_triangles.argmax())
+    remove_triangle_mask = clusters != keep_component
+    removed_faces = int(remove_triangle_mask.sum())
+    if removed_faces == 0:
+        return mesh
+
+    mesh.remove_triangles_by_mask(remove_triangle_mask.tolist())
+    mesh = _clean_open3d_mesh(mesh)
+    if verbose:
+        tqdm.write(
+            f"{label}: kept largest connected body and removed "
+            f"{cluster_n_triangles.size - 1:,} unresolved component(s) "
+            f"({removed_faces:,} faces)"
+        )
+    return mesh
+
+
 def _smooth_open3d_game_mesh(mesh, verbose=False):
     iterations = int(os.environ.get("SAM3D_GAME_SMOOTH_ITERS", "1"))
     if iterations <= 0 or np.asarray(mesh.triangles).shape[0] == 0:
@@ -700,6 +739,7 @@ def _quality_preserve_game_mesh(
     if target >= source_faces:
         mesh = _snap_near_surface_components(mesh, verbose=verbose)
         mesh = _drop_unresolved_tiny_open3d_components(mesh, verbose=verbose)
+        mesh = _enforce_single_open3d_component(mesh, verbose=verbose)
         mesh = _weld_close_open3d_vertices(mesh, verbose=verbose, label="Final game weld")
         mesh = _smooth_open3d_game_mesh(mesh, verbose=verbose)
         out_vertices = np.asarray(mesh.vertices, dtype=np.float32)
@@ -726,6 +766,7 @@ def _quality_preserve_game_mesh(
     mesh = _weld_close_open3d_vertices(mesh, verbose=verbose, label="Post-simplify game weld")
     mesh = _snap_near_surface_components(mesh, verbose=verbose)
     mesh = _drop_unresolved_tiny_open3d_components(mesh, verbose=verbose)
+    mesh = _enforce_single_open3d_component(mesh, verbose=verbose)
     mesh = _weld_close_open3d_vertices(mesh, verbose=verbose, label="Final game weld")
     mesh = _smooth_open3d_game_mesh(mesh, verbose=verbose)
 
@@ -1247,12 +1288,39 @@ def to_glb(
 
     if game_remesh:
         if with_mesh_postprocess:
-            if verbose:
-                tqdm.write(
-                    "Skipping heavy pre-game mesh cleanup; "
-                    "the welded game mesh is built on CPU first."
+            source_face_count = int(faces.shape[0])
+            preclean_limit = _game_preclean_limit()
+            if preclean_limit > 0 and source_face_count <= preclean_limit:
+                preclean_ratio = _game_preclean_simplify_ratio()
+                if verbose:
+                    tqdm.write(
+                        "Running pre-game mesh cleanup before welding "
+                        f"({source_face_count:,} faces <= {preclean_limit:,}; "
+                        f"simplify={preclean_ratio:g})."
+                    )
+                vertices, faces = postprocess_mesh(
+                    vertices,
+                    faces,
+                    simplify=preclean_ratio > 0,
+                    simplify_ratio=preclean_ratio,
+                    fill_holes=fill_holes,
+                    fill_holes_max_hole_size=fill_holes_max_size,
+                    fill_holes_max_hole_nbe=int(250 * np.sqrt(max(0.0, 1 - preclean_ratio))),
+                    fill_holes_resolution=fill_holes_resolution,
+                    fill_holes_num_views=fill_holes_num_views,
+                    remove_floaters=True,
+                    floater_frac=float(os.environ.get("SAM3D_GAME_PRECLEAN_FLOATER_FRAC", "0.01")),
+                    debug=debug,
+                    verbose=verbose,
                 )
-            _emit_progress(progress_callback, "Skip pre-game cleanup", 1)
+                _emit_progress(progress_callback, "Pre-game cleanup", 1)
+            else:
+                if verbose:
+                    tqdm.write(
+                        "Skipping heavy pre-game mesh cleanup for large mesh; "
+                        "the welded game mesh is built on CPU first."
+                    )
+                _emit_progress(progress_callback, "Skip pre-game cleanup", 1)
 
         vertices, faces = game_remesh_mesh(
             vertices,

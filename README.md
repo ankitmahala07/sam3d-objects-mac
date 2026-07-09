@@ -142,10 +142,12 @@ The `Game` export builds a quality-safe welded mesh before UV unwrap and texture
 baking, so the texture is baked directly onto the exported game asset. The face
 target is treated as a quality hint, not a hard destructive cap: the exporter may
 keep more faces when a low target would damage the silhouette or texture bake.
-Close seams and near-surface fragments are welded into the main mesh on CPU
-before baking; only unresolved tiny leftovers are discarded. A light Taubin
-smoothing pass removes small surface spikes without the MPS-heavy cleanup that
-can crash on million-face decoded meshes.
+Moderate decoded meshes are pre-cleaned before the game reduction, then close
+seams and near-surface fragments are welded into the main mesh on CPU before
+baking. The final game mesh is forced to a single connected body; only unresolved
+leftovers are discarded after the weld attempt. Very large decoded meshes skip
+the pre-clean step to avoid the MPS-heavy cleanup that can crash on million-face
+assets.
 `Both` creates `mesh_game.glb` first and then `mesh.glb` for side-by-side
 comparison.
 
