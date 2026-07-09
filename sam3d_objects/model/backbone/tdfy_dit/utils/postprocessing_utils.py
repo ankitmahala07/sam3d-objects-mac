@@ -425,31 +425,232 @@ def _clean_open3d_mesh(mesh):
     return mesh
 
 
-def _prune_small_open3d_components(mesh, verbose=False, label="Game mesh cleanup"):
+def _mesh_scale(mesh):
+    vertices = np.asarray(mesh.vertices)
+    if vertices.size == 0:
+        return 1.0
+    extent = vertices.max(axis=0) - vertices.min(axis=0)
+    return max(float(np.linalg.norm(extent)), 1e-6)
+
+
+def _sample_median_edge_length(mesh, max_faces=50_000):
+    vertices = np.asarray(mesh.vertices)
+    triangles = np.asarray(mesh.triangles)
+    if vertices.size == 0 or triangles.size == 0:
+        return _mesh_scale(mesh) * 1e-3
+
+    if triangles.shape[0] > max_faces:
+        sample_idx = np.linspace(0, triangles.shape[0] - 1, max_faces).astype(np.int64)
+        triangles = triangles[sample_idx]
+
+    tri_vertices = vertices[triangles]
+    lengths = np.concatenate(
+        [
+            np.linalg.norm(tri_vertices[:, 0] - tri_vertices[:, 1], axis=1),
+            np.linalg.norm(tri_vertices[:, 1] - tri_vertices[:, 2], axis=1),
+            np.linalg.norm(tri_vertices[:, 2] - tri_vertices[:, 0], axis=1),
+        ]
+    )
+    lengths = lengths[np.isfinite(lengths) & (lengths > 0)]
+    if lengths.size == 0:
+        return _mesh_scale(mesh) * 1e-3
+    return float(np.median(lengths))
+
+
+def _game_weld_radius(mesh, multiplier=1.0):
+    scale = _mesh_scale(mesh)
+    median_edge = _sample_median_edge_length(mesh)
+    base_frac = float(os.environ.get("SAM3D_GAME_WELD_RADIUS_FRAC", "0.0005"))
+    max_frac = float(os.environ.get("SAM3D_GAME_MAX_WELD_RADIUS_FRAC", "0.003"))
+    edge_mult = float(os.environ.get("SAM3D_GAME_WELD_EDGE_MULT", "0.08"))
+    radius = max(scale * base_frac, median_edge * edge_mult) * float(multiplier)
+    return min(max(radius, scale * 1e-6), scale * max_frac)
+
+
+def _connected_component_count(mesh):
+    triangles = np.asarray(mesh.triangles)
+    if triangles.shape[0] == 0:
+        return 0
+    _, cluster_n_triangles, _ = mesh.cluster_connected_triangles()
+    return int(np.asarray(cluster_n_triangles).size)
+
+
+def _weld_close_open3d_vertices(mesh, verbose=False, label="Game mesh weld"):
+    if os.environ.get("SAM3D_GAME_WELD", "1").strip().lower() in ("0", "false", "no", "off"):
+        return mesh
+    if np.asarray(mesh.triangles).shape[0] == 0:
+        return mesh
+
+    before_vertices = len(mesh.vertices)
+    before_components = _connected_component_count(mesh)
+    passes = max(1, int(os.environ.get("SAM3D_GAME_WELD_PASSES", "1")))
+    last_radius = 0.0
+    for pass_idx in range(passes):
+        last_radius = _game_weld_radius(mesh, multiplier=1.0 + 0.75 * pass_idx)
+        merged = mesh.merge_close_vertices(last_radius)
+        if merged is not None:
+            mesh = merged
+        mesh = _clean_open3d_mesh(mesh)
+
+    after_components = _connected_component_count(mesh)
+    if verbose and (before_vertices != len(mesh.vertices) or before_components != after_components):
+        tqdm.write(
+            f"{label}: welded close vertices "
+            f"({before_vertices:,}->{len(mesh.vertices):,} verts, "
+            f"{before_components}->{after_components} components, radius<= {last_radius:.5f})"
+        )
+    return mesh
+
+
+def _open3d_mesh_from_arrays(vertices, triangles):
+    import open3d as o3d
+
+    out = o3d.geometry.TriangleMesh()
+    out.vertices = o3d.utility.Vector3dVector(vertices.astype(np.float64, copy=False))
+    out.triangles = o3d.utility.Vector3iVector(triangles.astype(np.int32, copy=False))
+    return _clean_open3d_mesh(out)
+
+
+def _snap_near_surface_components(mesh, verbose=False, label="Game mesh surface weld"):
+    if os.environ.get("SAM3D_GAME_SURFACE_WELD", "1").strip().lower() in ("0", "false", "no", "off"):
+        return mesh
+
+    triangles = np.asarray(mesh.triangles)
+    if triangles.shape[0] == 0:
+        return mesh
+    max_faces = int(os.environ.get("SAM3D_GAME_SURFACE_WELD_MAX_FACES", "150000"))
+    if triangles.shape[0] > max_faces:
+        return mesh
+
+    import open3d as o3d
+
+    total_snapped = 0
+    total_components = 0
+    max_passes = max(1, int(os.environ.get("SAM3D_GAME_SURFACE_WELD_PASSES", "3")))
+    for _ in range(max_passes):
+        vertices = np.asarray(mesh.vertices)
+        triangles = np.asarray(mesh.triangles)
+        clusters, cluster_n_triangles, _ = mesh.cluster_connected_triangles()
+        clusters = np.asarray(clusters)
+        cluster_n_triangles = np.asarray(cluster_n_triangles)
+        if cluster_n_triangles.size <= 1:
+            break
+
+        largest_component = int(cluster_n_triangles.argmax())
+        largest_faces = int(cluster_n_triangles[largest_component])
+        anchor_face_ids = np.flatnonzero(clusters == largest_component)
+        anchor_faces = triangles[anchor_face_ids]
+        anchor_vertices = np.unique(anchor_faces.reshape(-1))
+        local_index = -np.ones(vertices.shape[0], dtype=np.int64)
+        local_index[anchor_vertices] = np.arange(anchor_vertices.shape[0])
+
+        anchor_mesh = o3d.geometry.TriangleMesh()
+        anchor_mesh.vertices = o3d.utility.Vector3dVector(vertices[anchor_vertices].astype(np.float64, copy=False))
+        anchor_mesh.triangles = o3d.utility.Vector3iVector(local_index[anchor_faces].astype(np.int32, copy=False))
+        anchor_t = o3d.t.geometry.TriangleMesh.from_legacy(anchor_mesh)
+        scene = o3d.t.geometry.RaycastingScene()
+        scene.add_triangles(anchor_t)
+
+        surface_mult = float(os.environ.get("SAM3D_GAME_SURFACE_WELD_MULT", "5.0"))
+        surface_max_frac = float(os.environ.get("SAM3D_GAME_SURFACE_WELD_MAX_FRAC", "0.012"))
+        radius = min(
+            _game_weld_radius(mesh, multiplier=1.0) * surface_mult,
+            _mesh_scale(mesh) * surface_max_frac,
+        )
+        small_face_limit = max(
+            64,
+            int(largest_faces * float(os.environ.get("SAM3D_GAME_SMALL_COMPONENT_FRAC", "0.01"))),
+        )
+
+        replace = np.arange(vertices.shape[0], dtype=np.int64)
+        snapped_this_pass = 0
+        component_order = np.argsort(cluster_n_triangles)
+        for component_id in component_order:
+            component_id = int(component_id)
+            if component_id == largest_component:
+                continue
+            face_ids = np.flatnonzero(clusters == component_id)
+            if face_ids.size == 0:
+                continue
+            component_vertices = np.unique(triangles[face_ids].reshape(-1))
+            points = vertices[component_vertices].astype(np.float32, copy=False)
+            result = scene.compute_closest_points(o3d.core.Tensor(points))
+            closest_points = result["points"].numpy()
+            primitive_ids = result["primitive_ids"].numpy().astype(np.int64)
+            distances = np.linalg.norm(points - closest_points, axis=1)
+            finite = np.isfinite(distances) & (primitive_ids >= 0) & (primitive_ids < anchor_face_ids.shape[0])
+            if not bool(finite.any()):
+                continue
+
+            is_small_component = face_ids.size <= small_face_limit
+            close_limit = radius if is_small_component else radius * 0.55
+            snap_mask = finite & (distances <= close_limit)
+            if not bool(snap_mask.any()):
+                nearest = int(np.argmin(np.where(finite, distances, np.inf)))
+                if distances[nearest] <= radius:
+                    snap_mask[nearest] = True
+
+            if not bool(snap_mask.any()):
+                continue
+
+            snap_vertices = component_vertices[snap_mask]
+            snap_primitives = primitive_ids[snap_mask]
+            source_points = points[snap_mask]
+            anchor_triangles = triangles[anchor_face_ids[snap_primitives]]
+            anchor_positions = vertices[anchor_triangles]
+            nearest_corner = np.linalg.norm(
+                anchor_positions - source_points[:, None, :],
+                axis=2,
+            ).argmin(axis=1)
+            target_vertices = anchor_triangles[np.arange(anchor_triangles.shape[0]), nearest_corner]
+            replace[snap_vertices] = target_vertices
+            snapped_this_pass += int(snap_vertices.shape[0])
+            total_components += 1
+
+        if snapped_this_pass == 0:
+            break
+
+        triangles = replace[triangles]
+        valid = (
+            (triangles[:, 0] != triangles[:, 1])
+            & (triangles[:, 1] != triangles[:, 2])
+            & (triangles[:, 2] != triangles[:, 0])
+        )
+        mesh = _open3d_mesh_from_arrays(vertices, triangles[valid])
+        mesh = _weld_close_open3d_vertices(mesh, verbose=False, label=label)
+        total_snapped += snapped_this_pass
+
+    if verbose and total_snapped:
+        tqdm.write(
+            f"{label}: snapped {total_snapped:,} near-surface vertices from "
+            f"{total_components:,} component pass(es)"
+        )
+    return mesh
+
+
+def _drop_unresolved_tiny_open3d_components(mesh, verbose=False, label="Game mesh cleanup"):
     triangles = np.asarray(mesh.triangles)
     if triangles.shape[0] == 0:
         return mesh
 
-    clusters, cluster_n_triangles, cluster_area = mesh.cluster_connected_triangles()
+    clusters, cluster_n_triangles, _ = mesh.cluster_connected_triangles()
     cluster_n_triangles = np.asarray(cluster_n_triangles)
-    cluster_area = np.asarray(cluster_area)
     if cluster_n_triangles.size <= 1:
         return mesh
 
     clusters = np.asarray(clusters)
     largest_faces = int(cluster_n_triangles.max())
-    largest_area = float(cluster_area.max()) if cluster_area.size else 0.0
     min_faces_default = max(
         12,
-        int(largest_faces * 0.03),
-        int(triangles.shape[0] * 0.0002),
+        int(largest_faces * 0.0004),
+        int(triangles.shape[0] * 0.00002),
     )
     min_faces = int(os.environ.get("SAM3D_GAME_MIN_COMPONENT_FACES", min_faces_default))
-    min_area_frac = float(os.environ.get("SAM3D_GAME_MIN_COMPONENT_AREA_FRAC", "0.003"))
-    min_area = largest_area * min_area_frac
 
-    keep_components = (cluster_n_triangles >= min_faces) | (cluster_area >= min_area)
+    keep_components = cluster_n_triangles >= min_faces
     if not bool(keep_components.any()):
+        keep_components[int(cluster_n_triangles.argmax())] = True
+    else:
         keep_components[int(cluster_n_triangles.argmax())] = True
 
     remove_triangle_mask = ~keep_components[clusters]
@@ -462,9 +663,9 @@ def _prune_small_open3d_components(mesh, verbose=False, label="Game mesh cleanup
     mesh = _clean_open3d_mesh(mesh)
     if verbose:
         tqdm.write(
-            f"{label}: removed {removed_components:,}/{cluster_n_triangles.size:,} "
-            f"tiny components ({removed_faces:,} faces; min_faces={min_faces}, "
-            f"min_area_frac={min_area_frac:g})"
+            f"{label}: removed only unresolved tiny leftovers "
+            f"({removed_components:,}/{cluster_n_triangles.size:,} components, "
+            f"{removed_faces:,} faces; min_faces={min_faces})"
         )
     return mesh
 
@@ -492,11 +693,14 @@ def _quality_preserve_game_mesh(
     mesh.vertices = o3d.utility.Vector3dVector(vertices.astype(np.float64))
     mesh.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
     mesh = _clean_open3d_mesh(mesh)
-    mesh = _prune_small_open3d_components(mesh, verbose=verbose, label="Source game cleanup")
+    mesh = _weld_close_open3d_vertices(mesh, verbose=verbose, label="Source game weld")
 
     source_faces = int(np.asarray(mesh.triangles).shape[0])
     target = _resolve_quality_game_target(source_faces, target_faces)
     if target >= source_faces:
+        mesh = _snap_near_surface_components(mesh, verbose=verbose)
+        mesh = _drop_unresolved_tiny_open3d_components(mesh, verbose=verbose)
+        mesh = _weld_close_open3d_vertices(mesh, verbose=verbose, label="Final game weld")
         mesh = _smooth_open3d_game_mesh(mesh, verbose=verbose)
         out_vertices = np.asarray(mesh.vertices, dtype=np.float32)
         out_faces = np.asarray(mesh.triangles, dtype=np.int64)
@@ -519,7 +723,10 @@ def _quality_preserve_game_mesh(
         boundary_weight=20.0,
     )
     mesh = _clean_open3d_mesh(mesh)
-    mesh = _prune_small_open3d_components(mesh, verbose=verbose, label="Final game cleanup")
+    mesh = _weld_close_open3d_vertices(mesh, verbose=verbose, label="Post-simplify game weld")
+    mesh = _snap_near_surface_components(mesh, verbose=verbose)
+    mesh = _drop_unresolved_tiny_open3d_components(mesh, verbose=verbose)
+    mesh = _weld_close_open3d_vertices(mesh, verbose=verbose, label="Final game weld")
     mesh = _smooth_open3d_game_mesh(mesh, verbose=verbose)
 
     out_vertices = np.asarray(mesh.vertices, dtype=np.float32)
@@ -1043,7 +1250,7 @@ def to_glb(
             if verbose:
                 tqdm.write(
                     "Skipping heavy pre-game mesh cleanup; "
-                    "the quality game mesh is built on CPU first."
+                    "the welded game mesh is built on CPU first."
                 )
             _emit_progress(progress_callback, "Skip pre-game cleanup", 1)
 

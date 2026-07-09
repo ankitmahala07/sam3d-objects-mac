@@ -138,13 +138,14 @@ Output in `outputs/<name>/`:
 | `mesh_game.glb` | optional/default game-oriented low-poly textured mesh  |
 | `mesh.glb`      | optional unoptimised high-detail textured mesh         |
 
-The `Game` export builds a quality-safe mesh before UV unwrap and texture
+The `Game` export builds a quality-safe welded mesh before UV unwrap and texture
 baking, so the texture is baked directly onto the exported game asset. The face
 target is treated as a quality hint, not a hard destructive cap: the exporter may
 keep more faces when a low target would damage the silhouette or texture bake.
-Tiny disconnected mesh islands are pruned on CPU before baking, and a light
-Taubin smoothing pass removes small surface spikes without the MPS-heavy cleanup
-that can crash on million-face decoded meshes.
+Close seams and near-surface fragments are welded into the main mesh on CPU
+before baking; only unresolved tiny leftovers are discarded. A light Taubin
+smoothing pass removes small surface spikes without the MPS-heavy cleanup that
+can crash on million-face decoded meshes.
 `Both` creates `mesh_game.glb` first and then `mesh.glb` for side-by-side
 comparison.
 
@@ -235,7 +236,7 @@ when it exits.
 ```
  ┌── Stage 1: cli.py ───────────────┐        ┌── Stage 2: ply2glb.py ───────┐
  │  photo → rembg mask              │        │  slat.pt → mesh decoder      │
- │  → sparse-structure diffusion    │  exit  │  → quality game mesh         │
+ │  → sparse-structure diffusion    │  exit  │  → welded game mesh          │
  │  → SLAT diffusion                │ ─────▶ │  → multi-view texture bake   │
  │  → gaussian splat  (splat.ply)   │ (frees │  → textured mesh.glb         │
  │  → sparse latent   (slat.pt)     │  mem)  │                              │

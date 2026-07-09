@@ -205,7 +205,7 @@ def main():
     ok(f"Device: {render_device}")
     if args.game_ready:
         ok(f"Game-ready remesh: target={target_faces or 'auto'}")
-        ok("Game-ready method: quality-safe mesh export")
+        ok("Game-ready method: quality-safe welded mesh export")
     progress = make_progress(extra_units=1 if args.game_ready else 0)
 
     hdr("LOADING ASSETS")
@@ -270,7 +270,7 @@ def main():
     texture_size = int_env("SAM3D_TEXTURE_SIZE", 2048)
     if on_mps:
         step(
-            ("Quality game mesh → streamed texture bake " if args.game_ready else "Mesh cleanup → streamed texture bake ")
+            ("Welded game mesh → streamed texture bake " if args.game_ready else "Mesh cleanup → streamed texture bake ")
             + f"({texture_views} views @ {texture_render_resolution}px, {texture_size}px atlas)…"
         )
     else:

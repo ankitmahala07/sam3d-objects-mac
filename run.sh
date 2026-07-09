@@ -125,7 +125,7 @@ if [[ -n "$1" && "$1" != "full" ]]; then
     echo "Usage:"
     echo "  ./run.sh [full]               image -> gaussian splat -> textured GLB"
     echo "  ./run.sh glb <dir>            re-convert splat.ply -> mesh.glb"
-    echo "  ./run.sh game <dir> [faces]   pre-bake quality game mesh -> mesh_game.glb"
+    echo "  ./run.sh game <dir> [faces]   pre-bake welded game mesh -> mesh_game.glb"
     exit 1
 fi
 

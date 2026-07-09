@@ -134,7 +134,7 @@ def get_steps():
 def get_export_mode():
     hdr("STEP 4 — GLB OUTPUT")
     print(f"  {B}?{RST}  Which GLB should be generated?")
-    print(f"     {G}▶{RST} [1] Game        ·  low-poly game mesh (default)")
+    print(f"     {G}▶{RST} [1] Game        ·  welded low-poly game mesh (default)")
     print(f"       [2] Unoptimised ·  original high-detail mesh")
     print(f"       [3] Both        ·  mesh_game.glb + mesh.glb")
     while True:
@@ -167,7 +167,7 @@ def get_game_options(export_mode):
             break
         err("Enter auto or a number >= 500.")
 
-    ok(f"Game mesh: quality-safe target={target}")
+    ok(f"Game mesh: welded quality-safe target={target}")
     return target, "quality"
 
 
