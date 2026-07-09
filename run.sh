@@ -3,7 +3,7 @@
 #
 #   ./run.sh            image → gaussian splat → chosen textured GLB output
 #   ./run.sh glb <dir>  re-convert one output dir's splat.ply → mesh.glb
-#   ./run.sh game <dir> [faces] [method]  create mesh_game.glb with pre-bake game mesh
+#   ./run.sh game <dir> [faces]  create mesh_game.glb with pre-bake retopo mesh
 #
 # The full flow runs in two separate processes on purpose: the CLI generates the
 # splat and then EXITS, so macOS reclaims all of its model memory before the GLB
@@ -116,7 +116,7 @@ if [[ "$1" == "game" || "$1" == "remesh" ]]; then
     exec "$PY" "$SCRIPT_DIR/ply2glb.py" \
         --game-ready \
         --target-faces "${3:-auto}" \
-        --remesh-method "${4:-decimate}" \
+        --remesh-method retopo \
         "${2:-}"
 fi
 
@@ -125,8 +125,7 @@ if [[ -n "$1" && "$1" != "full" ]]; then
     echo "Usage:"
     echo "  ./run.sh [full]               image -> gaussian splat -> textured GLB"
     echo "  ./run.sh glb <dir>            re-convert splat.ply -> mesh.glb"
-    echo "  ./run.sh game <dir> [faces] [method]"
-    echo "                                  pre-bake game mesh -> mesh_game.glb"
+    echo "  ./run.sh game <dir> [faces]   pre-bake retopo game mesh -> mesh_game.glb"
     exit 1
 fi
 
@@ -161,7 +160,7 @@ while IFS=$'\t' read -r objdir progress_done progress_total export_mode game_tar
     [[ -z "$objdir" ]] && continue
     export_mode="${export_mode:-game}"
     game_target="${game_target:-auto}"
-    game_method="${game_method:-decimate}"
+    game_method="${game_method:-retopo}"
     wait_for_memory 12          # cheap if already free; guards multi-object runs
     echo "  → $objdir"
     if [[ "$export_mode" == "game" ]]; then

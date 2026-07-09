@@ -153,10 +153,10 @@ def get_export_mode():
 
 def get_game_options(export_mode):
     if export_mode not in ("game", "both"):
-        return "auto", "decimate"
+        return "auto", "retopo"
 
-    hdr("STEP 5 — GAME MESH")
-    print(f"  {B}?{RST}  Target face count for the game mesh")
+    hdr("STEP 5 — RETOPO GAME MESH")
+    print(f"  {B}?{RST}  Target final triangle budget for the retopo game mesh")
     print(f"       Examples: 2000 for simple props, 10000 for complex objects")
     while True:
         target = ask("Target faces, or auto", "auto").strip().lower()
@@ -166,19 +166,8 @@ def get_game_options(export_mode):
             break
         err("Enter auto or a number >= 500.")
 
-    print(f"\n  {B}?{RST}  Game remesh method")
-    print(f"     {G}▶{RST} [1] Existing      ·  stable quadric decimation")
-    print(f"       [2] Experimental  ·  feature-aware retopo, preserves more detail before baking")
-    while True:
-        raw = ask("Enter 1–2", 1)
-        if raw == "1":
-            ok(f"Game mesh: existing method, target={target}")
-            return target, "decimate"
-        if raw == "2":
-            warn("Experimental is automatic feature-aware retopo, not hand-authored quad loops.")
-            ok(f"Game mesh: experimental method, target={target}")
-            return target, "experimental"
-        err("Enter 1 or 2.")
+    ok(f"Game mesh: retopo target={target}")
+    return target, "retopo"
 
 
 # ── full pipeline ─────────────────────────────────────────────────────────────

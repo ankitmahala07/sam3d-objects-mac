@@ -125,8 +125,8 @@ and GLB output mode, then runs end to end:
    `Low = 10` (default), `Medium = 25`, `High = 50`, or a custom value.
 4. **GLB output** — choose the generated mesh export:
    `Game` (default), `Unoptimised`, or `Both`.
-5. **Game mesh settings** — shown only for `Game` or `Both`: target face count
-   and remesh method.
+5. **Game mesh settings** — shown only for `Game` or `Both`: retopo triangle
+   target.
 
 Output in `outputs/<name>/`:
 
@@ -136,25 +136,23 @@ Output in `outputs/<name>/`:
 | `splat.ply`     | the raw gaussian splat                                 |
 | `slat.pt`       | the sparse latent (input to the mesh decoder)          |
 | `mesh_game.glb` | optional/default game-oriented low-poly textured mesh  |
+| `mesh_game_retopo.obj` | editable quad-retopo source mesh for inspection |
 | `mesh.glb`      | optional unoptimised high-detail textured mesh         |
 
-The `Game` export remeshes before UV unwrap and texture baking, so the texture is
-baked directly onto the lower-poly asset. `Both` creates `mesh_game.glb` first
-and then `mesh.glb` for side-by-side comparison.
+The `Game` export retopologizes before UV unwrap and texture baking, so the
+texture is baked directly onto the rebuilt lower-poly asset. `Both` creates
+`mesh_game.glb` first and then `mesh.glb` for side-by-side comparison.
 
-Game remesh methods:
+Game retopo uses Blender QuadriFlow, so Blender must be installed or pointed to
+with `SAM3D_BLENDER=/path/to/Blender`. This is intentionally not a triangle
+reduction pass: it rebuilds the surface into cleaner quad-style topology first,
+then bakes the generated texture onto that mesh.
 
-| Method | Use when | Notes |
-|--------|----------|-------|
-| Existing | you want the stable current flow | fast quadric decimation to the requested face budget |
-| Experimental | complex objects need more shape preservation | keeps more source geometry before reduction and uses feature-aware retopo |
-
-GLB files are runtime meshes and are stored as triangles. The experimental mode
-tries to produce cleaner automatic topology, but true senior-artist quad loops
-still require a dedicated retopology tool or manual cleanup in a DCC app.
-Targets below 500 faces are rejected to avoid accidentally destroying silhouettes.
-The target is treated as a quality goal; the exporter may keep a little more
-geometry if forcing the exact count would visibly damage the object.
+GLB files are runtime meshes and are stored as triangles. For topology
+inspection/editing, use `mesh_game_retopo.obj`; that sidecar is saved before
+texture baking. Targets below 500 faces are rejected to avoid accidentally
+destroying silhouettes, and the target is treated as an approximate final GLB
+triangle budget because the source retopo mesh is quad-based before export.
 
 **Re-bake the mesh only** (skips the expensive splat step) from an existing
 `splat.ply` + `slat.pt`:
@@ -166,13 +164,10 @@ geometry if forcing the exact count would visibly damage the object.
 **Create only the game mesh** from an existing result folder:
 
 ```bash
-./run.sh game outputs/<name> 2000 experimental
+./run.sh game outputs/<name> 2000
 ```
 
-Use `auto` instead of a number to pick a target automatically. Use `decimate`
-instead of `experimental` for the stable existing method. Advanced: pass
-`--strict-face-budget` to `ply2glb.py` only when an exact cap matters more than
-visual quality.
+Use `auto` instead of a number to pick a target automatically.
 
 ---
 
@@ -228,8 +223,8 @@ splats back on MPS for texture baking. This is slower but avoids the macOS
 `killed` failure during `DECODING MESH`. Override with:
 
 ```bash
-SAM3D_MESH_DECODE_DEVICE=mps ./run.sh game outputs/<name> 1600 experimental
-SAM3D_CPU_DECODE_VOXELS=50000 ./run.sh game outputs/<name> 1600 experimental
+SAM3D_MESH_DECODE_DEVICE=mps ./run.sh game outputs/<name> 1600
+SAM3D_CPU_DECODE_VOXELS=50000 ./run.sh game outputs/<name> 1600
 ```
 
 ---
@@ -243,7 +238,7 @@ when it exits.
 ```
  ┌── Stage 1: cli.py ───────────────┐        ┌── Stage 2: ply2glb.py ───────┐
  │  photo → rembg mask              │        │  slat.pt → mesh decoder      │
- │  → sparse-structure diffusion    │  exit  │  → decimate + fill holes     │
+ │  → sparse-structure diffusion    │  exit  │  → fill holes + retopo       │
  │  → SLAT diffusion                │ ─────▶ │  → multi-view texture bake   │
  │  → gaussian splat  (splat.ply)   │ (frees │  → textured mesh.glb         │
  │  → sparse latent   (slat.pt)     │  mem)  │                              │

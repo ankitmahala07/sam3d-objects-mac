@@ -4,15 +4,15 @@ ply2glb — Convert a SAM-3D gaussian splat to a textured GLB mesh.
 
 Usage:
     python ply2glb.py <output_folder>
-    python ply2glb.py --game-ready --target-faces 2000 --remesh-method decimate <output_folder>
+    python ply2glb.py --game-ready --target-faces 2000 <output_folder>
     ./run.sh glb <output_folder>
-    ./run.sh game <output_folder> [target_faces] [decimate|experimental]
+    ./run.sh game <output_folder> [target_faces]
 
 Loads only the mesh decoder (~500 MB), not the full inference pipeline.
 Requires slat.pt and splat.ply to exist in <output_folder>.
 """
 
-import sys, os, time, argparse, gc
+import sys, os, time, argparse, gc, shutil
 import torch
 import numpy as np
 from sam3d_progress import CliProgress
@@ -85,12 +85,25 @@ def parse_target_faces(raw):
 
 
 def parse_remesh_method(raw):
-    value = (raw or "decimate").strip().lower()
-    if value in ("decimate", "stable", "existing", "quadric"):
-        return "decimate"
-    if value in ("experimental", "retopo", "artist", "feature", "feature-aware"):
-        return "experimental"
-    err(f"Invalid remesh method: {raw}. Use decimate or experimental.")
+    value = (raw or "retopo").strip().lower()
+    if value in ("retopo", "quadriflow", "blender"):
+        return "retopo"
+    err("Game export only supports true retopo now. Use retopo.")
+
+
+def find_blender_executable():
+    env_path = os.environ.get("SAM3D_BLENDER")
+    candidates = [
+        env_path,
+        shutil.which("blender"),
+        "/Applications/Blender.app/Contents/MacOS/Blender",
+        "/opt/homebrew/bin/blender",
+        "/usr/local/bin/blender",
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
 
 
 def parse_args():
@@ -106,7 +119,7 @@ def parse_args():
         "--game-ready",
         "--remesh",
         action="store_true",
-        help="Optimize the mesh before UV unwrap and texture baking, writing mesh_game.glb.",
+        help="Retopologize the mesh before UV unwrap and texture baking, writing mesh_game.glb.",
     )
     parser.add_argument(
         "--target-faces",
@@ -115,13 +128,8 @@ def parse_args():
     )
     parser.add_argument(
         "--remesh-method",
-        default="decimate",
-        help="Game remesh method: decimate (stable) or experimental (feature-aware).",
-    )
-    parser.add_argument(
-        "--strict-face-budget",
-        action="store_true",
-        help="Force the mesh under the requested face count. Can reduce visual quality.",
+        default="retopo",
+        help="Game mesh method. Only true retopo is supported.",
     )
     parser.add_argument(
         "--output",
@@ -196,6 +204,7 @@ def main():
     slat_path = os.path.join(folder, "slat.pt")
     out_name = args.output or ("mesh_game.glb" if args.game_ready else "mesh.glb")
     glb_path  = os.path.join(folder, out_name)
+    retopo_sidecar_path = os.path.join(folder, "mesh_game_retopo.obj") if args.game_ready else None
     target_faces = parse_target_faces(args.target_faces)
     remesh_method = parse_remesh_method(args.remesh_method)
 
@@ -212,7 +221,15 @@ def main():
     ok(f"Device: {render_device}")
     if args.game_ready:
         ok(f"Game-ready remesh: target={target_faces or 'auto'}")
-        ok(f"Game-ready method: {remesh_method}")
+        ok(f"Game-ready method: retopo")
+        blender_path = find_blender_executable()
+        if not blender_path:
+            err(
+                "Game retopo requires Blender QuadriFlow, but Blender was not found. "
+                "Install Blender or set SAM3D_BLENDER=/path/to/Blender. "
+                "Use './run.sh glb <dir>' for an unoptimised GLB without retopo."
+            )
+        ok(f"Retopo backend: Blender QuadriFlow ({blender_path})")
     progress = make_progress(extra_units=1 if args.game_ready else 0)
 
     hdr("LOADING ASSETS")
@@ -267,7 +284,7 @@ def main():
             "Re-run the CLI to regenerate this object before converting to GLB.")
 
     hdr("CLEANUP MESH + BAKE TEXTURE + EXPORT GLB")
-    progress("phase", label="Cleanup + texture bake")
+    progress("phase", label="Retopo + texture bake" if args.game_ready else "Cleanup + texture bake")
     t0 = time.time()
     from sam3d_objects.model.backbone.tdfy_dit.utils.postprocessing_utils import to_glb
     import torch as _t
@@ -277,20 +294,20 @@ def main():
     texture_size = int_env("SAM3D_TEXTURE_SIZE", 2048)
     if on_mps:
         step(
-            "Mesh cleanup → streamed texture bake "
-            f"({texture_views} views @ {texture_render_resolution}px, {texture_size}px atlas)…"
+            ("Mesh cleanup → retopo → streamed texture bake " if args.game_ready else "Mesh cleanup → streamed texture bake ")
+            + f"({texture_views} views @ {texture_render_resolution}px, {texture_size}px atlas)…"
         )
     else:
         step("Running to_glb (texture baking ~1 min)…")
     # Full pipeline now runs on MPS via pure-PyTorch rasterizers:
-    #   - mesh postprocess: pyvista decimation (triangulated first) + _fill_holes (z-buffered
+    #   - mesh postprocess: mesh simplification (triangulated first) + _fill_holes (z-buffered
     #     software mesh raster instead of nvdiffrast)
     #   - texture baking: gsplat_silicon multi-view render + z-buffered UV raster + grid_sample
     # fill_holes views/resolution are reduced on MPS so the software rasterizer stays tractable.
     glb = to_glb(
         gs,
         mesh_result,
-        simplify=0.50 if args.game_ready and remesh_method == "experimental" else 0.90,
+        simplify=0.0 if args.game_ready else 0.90,
         fill_holes=True,
         fill_holes_resolution=512 if on_mps else 1024,
         fill_holes_num_views=100 if on_mps else 1000,
@@ -300,7 +317,7 @@ def main():
         game_remesh=args.game_ready,
         game_target_faces=target_faces,
         game_remesh_method=remesh_method,
-        game_strict_faces=args.strict_face_budget,
+        game_retopo_sidecar_path=retopo_sidecar_path,
         texture_mode="average",  # smooth angle-weighted multi-view average (no Adam patchiness)
         with_mesh_postprocess=True,   # includes floater removal (remove_floaters default on)
         with_texture_baking=True,
@@ -317,6 +334,8 @@ def main():
     else:
         progress.close()
     saved(out_name, glb_path)
+    if retopo_sidecar_path and os.path.isfile(retopo_sidecar_path):
+        saved("retopo.obj", retopo_sidecar_path)
 
     hdr("DONE")
 

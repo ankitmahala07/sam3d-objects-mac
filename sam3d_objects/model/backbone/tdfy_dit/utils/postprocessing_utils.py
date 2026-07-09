@@ -1,5 +1,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 from typing import *
+import os
+import shutil
+import subprocess
+import tempfile
+import textwrap
 import numpy as np
 import torch
 import utils3d
@@ -308,13 +313,13 @@ def postprocess_mesh(
         mesh = pv.PolyData(
             vertices, np.concatenate([np.full((faces.shape[0], 1), 3), faces], axis=1)
         )
-        # pyvista.decimate requires an all-triangle mesh; triangulate first to be safe.
+        # The cleanup simplifier expects an all-triangle mesh; triangulate first.
         mesh = mesh.triangulate()
         mesh = mesh.decimate(simplify_ratio, progress_bar=verbose)
         vertices, faces = mesh.points, mesh.faces.reshape(-1, 4)[:, 1:]
         if verbose:
             tqdm.write(
-                f"After decimate: {vertices.shape[0]} vertices, {faces.shape[0]} faces"
+                f"After simplify: {vertices.shape[0]} vertices, {faces.shape[0]} faces"
             )
 
     # Remove invisible faces
@@ -339,7 +344,7 @@ def postprocess_mesh(
                 f"After remove invisible faces: {vertices.shape[0]} vertices, {faces.shape[0]} faces"
             )
 
-    # Drop small disconnected pieces ("floaters"): decimation + mincut can leave dozens
+    # Drop small disconnected pieces ("floaters"): cleanup + mincut can leave dozens
     # of tiny islands. Keep only components with at least floater_frac of the largest
     # component's face count (with a small absolute floor).
     if remove_floaters:
@@ -376,287 +381,176 @@ def resolve_game_target_faces(face_count, target_faces=None):
     return 10000
 
 
+def find_blender_executable():
+    env_path = os.environ.get("SAM3D_BLENDER")
+    candidates = [
+        env_path,
+        shutil.which("blender"),
+        "/Applications/Blender.app/Contents/MacOS/Blender",
+        "/opt/homebrew/bin/blender",
+        "/usr/local/bin/blender",
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
 def normalize_game_remesh_method(method):
-    value = (method or "decimate").lower()
-    if value in ("decimate", "stable", "existing", "quadric"):
-        return "decimate"
-    if value in ("experimental", "retopo", "artist", "feature", "feature-aware"):
-        return "experimental"
-    return "decimate"
+    value = (method or "retopo").lower()
+    if value in ("retopo", "quadriflow", "blender"):
+        return "retopo"
+    raise RuntimeError("Game export only supports true retopo now. Use retopo.")
 
 
-def _polydata_from_triangles(vertices: np.ndarray, faces: np.ndarray):
-    return pv.PolyData(
-        vertices.astype(np.float64),
-        np.concatenate([np.full((faces.shape[0], 1), 3), faces], axis=1),
-    ).triangulate().clean()
+def _load_mesh_arrays(path):
+    loaded = trimesh.load(path, force="scene", process=False)
+    if isinstance(loaded, trimesh.Scene):
+        meshes = [
+            geom for geom in loaded.geometry.values()
+            if hasattr(geom, "vertices") and hasattr(geom, "faces")
+        ]
+        if not meshes:
+            raise RuntimeError("Retopo backend produced no mesh geometry")
+        mesh = trimesh.util.concatenate(meshes)
+    else:
+        mesh = loaded
+    vertices = np.asarray(mesh.vertices, dtype=np.float32)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    if vertices.size == 0 or faces.size == 0:
+        raise RuntimeError("Retopo backend produced an empty mesh")
+    return vertices, faces
 
 
-def _triangle_only_polydata(mesh):
-    mesh = mesh.copy()
-    mesh.clear_data()
-    mesh = mesh.extract_surface(
-        pass_pointid=False,
-        pass_cellid=False,
-        algorithm="dataset_surface",
-    ).triangulate().clean()
-    raw = np.asarray(mesh.faces)
-    if raw.size == 0:
-        return pv.PolyData(mesh.points)
-
-    triangles = []
-    i = 0
-    while i < raw.size:
-        n = int(raw[i])
-        face = raw[i + 1 : i + 1 + n]
-        if n == 3:
-            triangles.append(face)
-        i += n + 1
-
-    if not triangles:
-        return pv.PolyData(mesh.points)
-
-    faces = np.asarray(triangles, dtype=np.int64)
-    return _polydata_from_triangles(mesh.points, faces)
-
-
-def _polydata_to_triangles(mesh):
-    mesh = _triangle_only_polydata(mesh)
-    remesh_vertices = mesh.points.astype(np.float32)
-    remesh_faces = mesh.faces.reshape(-1, 4)[:, 1:].astype(np.int64)
-    return remesh_vertices, remesh_faces
-
-
-def _clean_open3d_mesh(mesh):
-    mesh.remove_duplicated_vertices()
-    mesh.remove_duplicated_triangles()
-    mesh.remove_degenerate_triangles()
-    mesh.remove_non_manifold_edges()
-    mesh.remove_unreferenced_vertices()
-    mesh.compute_vertex_normals()
-    return mesh
-
-
-def _enforce_face_budget(
+def _blender_quadriflow_retopo(
     vertices: np.ndarray,
     faces: np.ndarray,
-    target: int,
+    target_faces=None,
+    retopo_output_path: Optional[str] = None,
     verbose: bool = False,
-    label: str = "Final face budget",
 ):
-    if target >= faces.shape[0]:
-        return vertices, faces
+    blender = find_blender_executable()
+    if not blender:
+        raise RuntimeError(
+            "Game retopo requires Blender QuadriFlow. Install Blender or set "
+            "SAM3D_BLENDER=/path/to/Blender."
+        )
 
-    best_vertices, best_faces = vertices, faces
-    for _ in range(4):
-        if best_faces.shape[0] <= target:
-            break
-        reduction = 1.0 - (target / max(1, best_faces.shape[0]))
-        reduction = min(0.99, max(0.0, reduction))
-        if reduction <= 0:
-            break
-        try:
-            mesh = _polydata_from_triangles(best_vertices, best_faces)
-            mesh = mesh.decimate(
-                reduction,
-                volume_preservation=True,
-                boundary_constraints=True,
-                boundary_weight=20.0,
-                progress_bar=False,
+    target = resolve_game_target_faces(faces.shape[0], target_faces)
+    quad_target = max(250, int(round(target / 2)))
+    if verbose:
+        tqdm.write(
+            f"Blender QuadriFlow retopo: {vertices.shape[0]} vertices, "
+            f"{faces.shape[0]} triangles -> ~{quad_target} quads "
+            f"(~{target} GLB triangles)"
+        )
+
+    with tempfile.TemporaryDirectory(prefix="sam3d_retopo_") as tmp:
+        src_path = os.path.join(tmp, "source.obj")
+        dst_path = os.path.join(tmp, "retopo.obj")
+        script_path = os.path.join(tmp, "retopo.py")
+
+        trimesh.Trimesh(vertices=vertices, faces=faces, process=False).export(src_path)
+        script = textwrap.dedent(
+            f"""
+            import bpy
+            import sys
+
+            source = {src_path!r}
+            dest = {dst_path!r}
+            target_quads = {quad_target}
+
+            bpy.ops.wm.read_factory_settings(use_empty=True)
+
+            try:
+                bpy.ops.wm.obj_import(filepath=source)
+            except Exception:
+                bpy.ops.import_scene.obj(filepath=source)
+
+            meshes = [obj for obj in bpy.context.scene.objects if obj.type == 'MESH']
+            if not meshes:
+                print('No mesh imported', file=sys.stderr)
+                raise SystemExit(2)
+
+            bpy.ops.object.select_all(action='DESELECT')
+            for obj in meshes:
+                obj.select_set(True)
+            bpy.context.view_layer.objects.active = meshes[0]
+            if len(meshes) > 1:
+                bpy.ops.object.join()
+
+            obj = bpy.context.view_layer.objects.active
+            obj.select_set(True)
+            bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+
+            bpy.ops.object.quadriflow_remesh(
+                use_mesh_symmetry=False,
+                use_preserve_sharp=True,
+                use_preserve_boundary=True,
+                preserve_attributes=False,
+                smooth_normals=True,
+                mode='FACES',
+                target_faces=target_quads,
+                seed=0,
             )
-            cand_vertices, cand_faces = _polydata_to_triangles(mesh)
-        except Exception as exc:
+
+            bpy.ops.object.select_all(action='DESELECT')
+            bpy.context.view_layer.objects.active.select_set(True)
+            try:
+                bpy.ops.wm.obj_export(filepath=dest, export_selected_objects=True)
+            except Exception:
+                bpy.ops.export_scene.obj(filepath=dest, use_selection=True)
+            """
+        )
+        with open(script_path, "w") as f:
+            f.write(script)
+
+        proc = subprocess.run(
+            [blender, "--background", "--factory-startup", "--python", script_path],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if proc.returncode != 0 or not os.path.exists(dst_path):
+            detail = (proc.stderr or proc.stdout).strip()[-2000:]
+            raise RuntimeError(f"Blender QuadriFlow retopo failed: {detail}")
+
+        if retopo_output_path:
+            out_dir = os.path.dirname(os.path.abspath(retopo_output_path))
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            shutil.copyfile(dst_path, retopo_output_path)
             if verbose:
-                tqdm.write(f"{label} failed ({exc}); keeping previous mesh")
-            break
+                tqdm.write(f"Saved retopo source mesh: {retopo_output_path}")
 
-        if cand_faces.size == 0 or cand_faces.shape[0] >= best_faces.shape[0]:
-            break
-        best_vertices, best_faces = cand_vertices, cand_faces
-
-    if verbose and best_faces.shape[0] != faces.shape[0]:
-        tqdm.write(
-            f"{label}: {vertices.shape[0]} vertices, {faces.shape[0]} faces -> "
-            f"{best_vertices.shape[0]} vertices, {best_faces.shape[0]} faces"
-        )
-    return best_vertices, best_faces
-
-
-def _quadric_game_decimate(
-    vertices: np.ndarray,
-    faces: np.ndarray,
-    target_faces=None,
-    boundary_weight: float = 10.0,
-    strict_faces: bool = False,
-    verbose: bool = False,
-    label: str = "Game remesh",
-):
-    import open3d as o3d
-
-    target = resolve_game_target_faces(faces.shape[0], target_faces)
-    if target >= faces.shape[0]:
-        if verbose:
-            tqdm.write(
-                f"{label} skipped: {faces.shape[0]} faces already <= target {target}"
-            )
-        return vertices, faces
+        retopo_vertices, retopo_faces = _load_mesh_arrays(dst_path)
 
     if verbose:
         tqdm.write(
-            f"{label}: {vertices.shape[0]} vertices, {faces.shape[0]} faces -> "
-            f"target {target} faces"
+            f"After Blender QuadriFlow retopo: {retopo_vertices.shape[0]} vertices, "
+            f"{retopo_faces.shape[0]} triangles"
         )
-
-    mesh = o3d.geometry.TriangleMesh()
-    mesh.vertices = o3d.utility.Vector3dVector(vertices.astype(np.float64))
-    mesh.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
-    mesh = _clean_open3d_mesh(mesh)
-
-    mesh = mesh.simplify_quadric_decimation(
-        target_number_of_triangles=target,
-        boundary_weight=boundary_weight,
-    )
-    mesh = _clean_open3d_mesh(mesh)
-
-    remesh_vertices = np.asarray(mesh.vertices).astype(np.float32)
-    remesh_faces = np.asarray(mesh.triangles).astype(np.int64)
-    if remesh_vertices.size == 0 or remesh_faces.size == 0:
-        if verbose:
-            tqdm.write(f"{label} produced an empty mesh; keeping cleaned mesh")
-        return vertices, faces
-    if strict_faces:
-        remesh_vertices, remesh_faces = _enforce_face_budget(
-            remesh_vertices,
-            remesh_faces,
-            target,
-            verbose=verbose,
-            label=f"{label} hard budget",
-        )
-
-    if verbose:
-        tqdm.write(
-            f"After {label.lower()}: {remesh_vertices.shape[0]} vertices, "
-            f"{remesh_faces.shape[0]} faces"
-        )
-    return remesh_vertices, remesh_faces
-
-
-def _experimental_game_retopo(
-    vertices: np.ndarray,
-    faces: np.ndarray,
-    target_faces=None,
-    strict_faces: bool = False,
-    verbose: bool = False,
-):
-    target = resolve_game_target_faces(faces.shape[0], target_faces)
-    if target >= faces.shape[0]:
-        if verbose:
-            tqdm.write(
-                f"Experimental retopo skipped: {faces.shape[0]} faces already <= target {target}"
-            )
-        return vertices, faces
-
-    if verbose:
-        tqdm.write(
-            f"Experimental retopo: {vertices.shape[0]} vertices, {faces.shape[0]} faces -> "
-            f"target {target} faces"
-        )
-
-    try:
-        reduction = 1.0 - (target / max(1, faces.shape[0]))
-        reduction = min(0.98, max(0.0, reduction))
-        mesh = _polydata_from_triangles(vertices, faces)
-        mesh = mesh.compute_normals(
-            cell_normals=True,
-            point_normals=True,
-            split_vertices=False,
-            auto_orient_normals=True,
-            inplace=False,
-        )
-        mesh = _triangle_only_polydata(mesh)
-        mesh = mesh.decimate_pro(
-            reduction,
-            feature_angle=30.0,
-            split_angle=60.0,
-            splitting=True,
-            pre_split_mesh=True,
-            preserve_topology=True,
-            boundary_vertex_deletion=False,
-            progress_bar=verbose,
-        )
-        remesh_vertices, remesh_faces = _polydata_to_triangles(mesh)
-    except Exception as exc:
-        if verbose:
-            tqdm.write(
-                f"Experimental retopo failed ({exc}); falling back to stable decimation"
-            )
-        return _quadric_game_decimate(
-            vertices,
-            faces,
-            target_faces=target,
-            boundary_weight=20.0,
-            strict_faces=strict_faces,
-            verbose=verbose,
-            label="Game remesh fallback",
-        )
-
-    if remesh_vertices.size == 0 or remesh_faces.size == 0:
-        if verbose:
-            tqdm.write("Experimental retopo produced an empty mesh; keeping cleaned mesh")
-        return vertices, faces
-
-    if remesh_faces.shape[0] > target:
-        remesh_vertices, remesh_faces = _quadric_game_decimate(
-            remesh_vertices,
-            remesh_faces,
-            target_faces=target,
-            boundary_weight=25.0,
-            strict_faces=strict_faces,
-            verbose=verbose,
-            label="Experimental final limiter",
-        )
-    if strict_faces:
-        remesh_vertices, remesh_faces = _enforce_face_budget(
-            remesh_vertices,
-            remesh_faces,
-            target,
-            verbose=verbose,
-            label="Experimental hard budget",
-        )
-
-    if verbose:
-        tqdm.write(
-            f"After experimental retopo: {remesh_vertices.shape[0]} vertices, "
-            f"{remesh_faces.shape[0]} faces"
-        )
-    return remesh_vertices, remesh_faces
+    return retopo_vertices, retopo_faces
 
 
 def game_remesh_mesh(
     vertices: np.ndarray,
     faces: np.ndarray,
     target_faces=None,
-    method: str = "decimate",
-    strict_faces: bool = False,
+    method: str = "retopo",
+    retopo_output_path: Optional[str] = None,
     verbose: bool = False,
 ):
     method = normalize_game_remesh_method(method)
-    if method == "experimental":
-        return _experimental_game_retopo(
+    if method == "retopo":
+        return _blender_quadriflow_retopo(
             vertices,
             faces,
             target_faces=target_faces,
-            strict_faces=strict_faces,
+            retopo_output_path=retopo_output_path,
             verbose=verbose,
         )
-
-    return _quadric_game_decimate(
-        vertices,
-        faces,
-        target_faces=target_faces,
-        strict_faces=strict_faces,
-        verbose=verbose,
-    )
+    raise RuntimeError(f"Unsupported game mesh method: {method}")
 
 
 def parametrize_mesh(vertices: np.array, faces: np.array):
@@ -1115,8 +1009,8 @@ def to_glb(
     texture_render_resolution: int = 1024,
     game_remesh: bool = False,
     game_target_faces: Optional[int] = None,
-    game_remesh_method: str = "decimate",
-    game_strict_faces: bool = False,
+    game_remesh_method: str = "retopo",
+    game_retopo_sidecar_path: Optional[str] = None,
     debug: bool = False,
     verbose: bool = True,
     with_mesh_postprocess=True,
@@ -1165,7 +1059,7 @@ def to_glb(
             faces,
             target_faces=game_target_faces,
             method=game_remesh_method,
-            strict_faces=game_strict_faces,
+            retopo_output_path=game_retopo_sidecar_path,
             verbose=verbose,
         )
         _emit_progress(progress_callback, "Game remesh", 1)
