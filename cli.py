@@ -153,10 +153,11 @@ def get_export_mode():
 
 def get_game_options(export_mode):
     if export_mode not in ("game", "both"):
-        return "auto", "retopo"
+        return "auto", "quality"
 
-    hdr("STEP 5 — RETOPO GAME MESH")
-    print(f"  {B}?{RST}  Target final triangle budget for the retopo game mesh")
+    hdr("STEP 5 — GAME MESH")
+    print(f"  {B}?{RST}  Target triangle budget for the game mesh")
+    print(f"       The exporter may keep more faces when needed to preserve the object.")
     print(f"       Examples: 2000 for simple props, 10000 for complex objects")
     while True:
         target = ask("Target faces, or auto", "auto").strip().lower()
@@ -166,8 +167,8 @@ def get_game_options(export_mode):
             break
         err("Enter auto or a number >= 500.")
 
-    ok(f"Game mesh: retopo target={target}")
-    return target, "retopo"
+    ok(f"Game mesh: quality-safe target={target}")
+    return target, "quality"
 
 
 # ── full pipeline ─────────────────────────────────────────────────────────────

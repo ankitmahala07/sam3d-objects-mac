@@ -85,10 +85,10 @@ def parse_target_faces(raw):
 
 
 def parse_remesh_method(raw):
-    value = (raw or "retopo").strip().lower()
-    if value in ("retopo", "native", "sam3d", "surface-net", "surfacenet"):
-        return "retopo"
-    err("Game export only supports true retopo now. Use retopo.")
+    value = (raw or "quality").strip().lower()
+    if value in ("quality", "safe", "preserve", "game", "retopo"):
+        return "quality"
+    err("Game export only supports quality-safe mesh export now.")
 
 
 def parse_args():
@@ -104,7 +104,7 @@ def parse_args():
         "--game-ready",
         "--remesh",
         action="store_true",
-        help="Retopologize the mesh before UV unwrap and texture baking, writing mesh_game.glb.",
+        help="Create a quality-safe game mesh before UV unwrap and texture baking, writing mesh_game.glb.",
     )
     parser.add_argument(
         "--target-faces",
@@ -113,8 +113,8 @@ def parse_args():
     )
     parser.add_argument(
         "--remesh-method",
-        default="retopo",
-        help="Game mesh method. Uses the native surface-net retopo backend.",
+        default="quality",
+        help="Game mesh method. Default is quality-safe.",
     )
     parser.add_argument(
         "--output",
@@ -189,7 +189,6 @@ def main():
     slat_path = os.path.join(folder, "slat.pt")
     out_name = args.output or ("mesh_game.glb" if args.game_ready else "mesh.glb")
     glb_path  = os.path.join(folder, out_name)
-    retopo_sidecar_path = os.path.join(folder, "mesh_game_retopo.obj") if args.game_ready else None
     target_faces = parse_target_faces(args.target_faces)
     remesh_method = parse_remesh_method(args.remesh_method)
 
@@ -206,7 +205,7 @@ def main():
     ok(f"Device: {render_device}")
     if args.game_ready:
         ok(f"Game-ready remesh: target={target_faces or 'auto'}")
-        ok("Game-ready method: native surface-net retopo")
+        ok("Game-ready method: quality-safe mesh export")
     progress = make_progress(extra_units=1 if args.game_ready else 0)
 
     hdr("LOADING ASSETS")
@@ -261,7 +260,7 @@ def main():
             "Re-run the CLI to regenerate this object before converting to GLB.")
 
     hdr("CLEANUP MESH + BAKE TEXTURE + EXPORT GLB")
-    progress("phase", label="Retopo + texture bake" if args.game_ready else "Cleanup + texture bake")
+    progress("phase", label="Game mesh + texture bake" if args.game_ready else "Cleanup + texture bake")
     t0 = time.time()
     from sam3d_objects.model.backbone.tdfy_dit.utils.postprocessing_utils import to_glb
     import torch as _t
@@ -271,7 +270,7 @@ def main():
     texture_size = int_env("SAM3D_TEXTURE_SIZE", 2048)
     if on_mps:
         step(
-            ("Native retopo → streamed texture bake " if args.game_ready else "Mesh cleanup → streamed texture bake ")
+            ("Quality game mesh → streamed texture bake " if args.game_ready else "Mesh cleanup → streamed texture bake ")
             + f"({texture_views} views @ {texture_render_resolution}px, {texture_size}px atlas)…"
         )
     else:
@@ -294,7 +293,7 @@ def main():
         game_remesh=args.game_ready,
         game_target_faces=target_faces,
         game_remesh_method=remesh_method,
-        game_retopo_sidecar_path=retopo_sidecar_path,
+        game_retopo_sidecar_path=None,
         texture_mode="average",  # smooth angle-weighted multi-view average (no Adam patchiness)
         with_mesh_postprocess=True,   # includes floater removal (remove_floaters default on)
         with_texture_baking=True,
@@ -311,8 +310,6 @@ def main():
     else:
         progress.close()
     saved(out_name, glb_path)
-    if retopo_sidecar_path and os.path.isfile(retopo_sidecar_path):
-        saved("retopo.obj", retopo_sidecar_path)
 
     hdr("DONE")
 

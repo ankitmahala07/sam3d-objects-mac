@@ -125,8 +125,8 @@ and GLB output mode, then runs end to end:
    `Low = 10` (default), `Medium = 25`, `High = 50`, or a custom value.
 4. **GLB output** — choose the generated mesh export:
    `Game` (default), `Unoptimised`, or `Both`.
-5. **Game mesh settings** — shown only for `Game` or `Both`: retopo triangle
-   target.
+5. **Game mesh settings** — shown only for `Game` or `Both`: target triangle
+   budget.
 
 Output in `outputs/<name>/`:
 
@@ -136,27 +136,17 @@ Output in `outputs/<name>/`:
 | `splat.ply`     | the raw gaussian splat                                 |
 | `slat.pt`       | the sparse latent (input to the mesh decoder)          |
 | `mesh_game.glb` | optional/default game-oriented low-poly textured mesh  |
-| `mesh_game_retopo.obj` | editable quad-retopo source mesh for inspection |
 | `mesh.glb`      | optional unoptimised high-detail textured mesh         |
 
-The `Game` export retopologizes before UV unwrap and texture baking, so the
-texture is baked directly onto the rebuilt lower-poly asset. `Both` creates
-`mesh_game.glb` first and then `mesh.glb` for side-by-side comparison.
+The `Game` export builds a quality-safe mesh before UV unwrap and texture
+baking, so the texture is baked directly onto the exported game asset. The face
+target is treated as a quality hint, not a hard destructive cap: the exporter may
+keep more faces when a low target would damage the silhouette or texture bake.
+`Both` creates `mesh_game.glb` first and then `mesh.glb` for side-by-side
+comparison.
 
-Game retopo uses the repo's native surface-net retopo backend. It is
-intentionally not a triangle reduction pass: it samples the generated surface as
-an object-aligned signed-distance field, rebuilds it as clean quad-style
-topology, then bakes the generated texture onto that mesh. Game exports run this
-retopo before the MPS-heavy visibility cleanup, so million-triangle decoded
-meshes are reduced on CPU before texture baking.
-
-GLB files are runtime meshes and are stored as triangles. For topology
-inspection/editing, use `mesh_game_retopo.obj`; that sidecar is saved before
-texture baking. Flat/simple regions receive larger grid faces at lower targets,
-while raising the target gives curved and detailed regions more cells. Targets
-below 500 faces are rejected to avoid accidentally destroying silhouettes, and
-the target is treated as an approximate final GLB triangle budget because the
-source retopo mesh is quad-based before export.
+GLB files are runtime meshes and are stored as triangles. Targets below 500
+faces are rejected to avoid accidentally destroying silhouettes.
 
 **Re-bake the mesh only** (skips the expensive splat step) from an existing
 `splat.ply` + `slat.pt`:
@@ -183,9 +173,9 @@ Generated crate sample:
   <img src="outputs/crate/extracted.png" width="360" alt="Generated crate cutout">
 </p>
 
-| Result | Faces | File |
-|--------|------:|------|
-| Game mesh | 2,000 | [`outputs/crate/mesh_game.glb`](outputs/crate/mesh_game.glb) |
+| Result | Face budget | File |
+|--------|------------:|------|
+| Game mesh | target 2,000 | [`outputs/crate/mesh_game.glb`](outputs/crate/mesh_game.glb) |
 | Unoptimised mesh | 14,994 | [`outputs/crate/mesh.glb`](outputs/crate/mesh.glb) |
 
 Open either `.glb` link on GitHub to use its built-in rotatable 3D viewer.
@@ -242,7 +232,7 @@ when it exits.
 ```
  ┌── Stage 1: cli.py ───────────────┐        ┌── Stage 2: ply2glb.py ───────┐
  │  photo → rembg mask              │        │  slat.pt → mesh decoder      │
- │  → sparse-structure diffusion    │  exit  │  → fill holes + retopo       │
+ │  → sparse-structure diffusion    │  exit  │  → quality game mesh         │
  │  → SLAT diffusion                │ ─────▶ │  → multi-view texture bake   │
  │  → gaussian splat  (splat.ply)   │ (frees │  → textured mesh.glb         │
  │  → sparse latent   (slat.pt)     │  mem)  │                              │

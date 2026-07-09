@@ -394,50 +394,97 @@ def resolve_game_target_faces(face_count, target_faces=None):
 
 
 def normalize_game_remesh_method(method):
-    value = (method or "retopo").lower()
-    if value in ("retopo", "native", "sam3d", "surface-net", "surfacenet"):
-        return "retopo"
-    raise RuntimeError("Game export only supports true retopo now. Use retopo.")
+    value = (method or "quality").lower()
+    if value in ("quality", "safe", "preserve", "game", "retopo"):
+        return "quality"
+    raise RuntimeError("Game export only supports quality-safe mesh export now.")
 
 
-def _native_surface_net_retopo(
+def _resolve_quality_game_target(face_count, target_faces=None):
+    requested = resolve_game_target_faces(face_count, target_faces)
+    if face_count <= requested:
+        return int(face_count)
+    if face_count > 300_000:
+        target = max(int(requested) * 10, 15_000)
+    elif face_count > 80_000:
+        target = max(int(requested) * 6, 12_000)
+    elif face_count > 20_000:
+        target = max(int(requested) * 4, 8_000)
+    else:
+        target = max(int(requested) * 3, int(requested))
+    return int(min(face_count, max(requested, min(target, 80_000))))
+
+
+def _quality_preserve_game_mesh(
     vertices: np.ndarray,
     faces: np.ndarray,
     target_faces=None,
-    retopo_output_path: Optional[str] = None,
     verbose: bool = False,
 ):
-    from sam3d_objects.retopo import retopologize, write_quad_obj
+    import open3d as o3d
 
-    target = resolve_game_target_faces(faces.shape[0], target_faces)
-    result = retopologize(vertices, faces, target_faces=target, verbose=verbose)
-    if retopo_output_path:
-        write_quad_obj(retopo_output_path, result.vertices, result.quads)
+    target = _resolve_quality_game_target(faces.shape[0], target_faces)
+    if target >= faces.shape[0]:
         if verbose:
-            tqdm.write(f"Saved retopo source mesh: {retopo_output_path}")
+            tqdm.write(
+                f"Quality game mesh kept source geometry: {faces.shape[0]:,} faces"
+            )
+        return vertices.astype(np.float32), faces.astype(np.int64)
+
+    if verbose:
+        requested = resolve_game_target_faces(faces.shape[0], target_faces)
+        tqdm.write(
+            "Quality game mesh: "
+            f"{vertices.shape[0]:,} vertices / {faces.shape[0]:,} faces -> "
+            f"~{target:,} faces (requested {requested:,}; preserving silhouette)"
+        )
+
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(vertices.astype(np.float64))
+    mesh.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
+    mesh.remove_duplicated_vertices()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_degenerate_triangles()
+    mesh.remove_unreferenced_vertices()
+    mesh.compute_vertex_normals()
+    mesh = mesh.simplify_quadric_decimation(
+        target_number_of_triangles=target,
+        boundary_weight=20.0,
+    )
+    mesh.remove_duplicated_vertices()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_degenerate_triangles()
+    mesh.remove_unreferenced_vertices()
+    mesh.compute_vertex_normals()
+
+    out_vertices = np.asarray(mesh.vertices, dtype=np.float32)
+    out_faces = np.asarray(mesh.triangles, dtype=np.int64)
+    if out_vertices.size == 0 or out_faces.size == 0:
+        if verbose:
+            tqdm.write("Quality game mesh failed; keeping source geometry")
+        return vertices.astype(np.float32), faces.astype(np.int64)
     if verbose:
         tqdm.write(
-            f"After native retopo: {result.vertices.shape[0]} vertices, "
-            f"{result.quads.shape[0]} quads / {result.faces.shape[0]} triangles"
+            f"After quality game mesh: {out_vertices.shape[0]:,} vertices / "
+            f"{out_faces.shape[0]:,} faces"
         )
-    return result.vertices, result.faces
+    return out_vertices, out_faces
 
 
 def game_remesh_mesh(
     vertices: np.ndarray,
     faces: np.ndarray,
     target_faces=None,
-    method: str = "retopo",
+    method: str = "quality",
     retopo_output_path: Optional[str] = None,
     verbose: bool = False,
 ):
     method = normalize_game_remesh_method(method)
-    if method == "retopo":
-        return _native_surface_net_retopo(
+    if method == "quality":
+        return _quality_preserve_game_mesh(
             vertices,
             faces,
             target_faces=target_faces,
-            retopo_output_path=retopo_output_path,
             verbose=verbose,
         )
     raise RuntimeError(f"Unsupported game mesh method: {method}")
@@ -899,7 +946,7 @@ def to_glb(
     texture_render_resolution: int = 1024,
     game_remesh: bool = False,
     game_target_faces: Optional[int] = None,
-    game_remesh_method: str = "retopo",
+    game_remesh_method: str = "quality",
     game_retopo_sidecar_path: Optional[str] = None,
     debug: bool = False,
     verbose: bool = True,
@@ -930,10 +977,10 @@ def to_glb(
         if with_mesh_postprocess:
             if verbose:
                 tqdm.write(
-                    "Skipping heavy pre-retopo mesh cleanup for game export; "
-                    "native retopo rebuilds the source mesh on CPU first."
+                    "Skipping heavy pre-game mesh cleanup; "
+                    "the quality game mesh is built on CPU first."
                 )
-            _emit_progress(progress_callback, "Skip pre-retopo cleanup", 1)
+            _emit_progress(progress_callback, "Skip pre-game cleanup", 1)
 
         vertices, faces = game_remesh_mesh(
             vertices,
