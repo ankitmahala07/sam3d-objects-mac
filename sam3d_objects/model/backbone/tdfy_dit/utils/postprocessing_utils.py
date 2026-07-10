@@ -1465,6 +1465,7 @@ def to_glb(
     game_remesh_method: str = "quality",
     game_retopo_sidecar_path: Optional[str] = None,
     experimental_retopo: bool = False,
+    experimental_smooth: bool = False,
     experimental_target_faces: Optional[int] = None,
     experimental_quad_path: Optional[str] = None,
     experimental_normal_path: Optional[str] = None,
@@ -1507,6 +1508,7 @@ def to_glb(
             faces,
             target_faces=experimental_target_faces,
             verbose=verbose,
+            smooth=experimental_smooth,
         )
         vertices, faces = result.vertices, result.faces
         if experimental_quad_path:

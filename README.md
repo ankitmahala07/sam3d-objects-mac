@@ -126,8 +126,9 @@ and GLB output mode, then runs end to end:
 3. **Quality** — diffusion steps for both stages:
    `Low = 10` (default), `Medium = 25`, `High = 50`, or a custom value.
 4. **GLB output** — choose the generated mesh export:
-   `Game` (default), `Unoptimised`, `Both`, or `Experimental`.
-5. **Mesh settings** — shown for `Game`, `Both`, or `Experimental`: target
+   `Game` (default), `Unoptimised`, `Both`, `Experimental`, or `Experimental V2`.
+5. **Mesh settings** — shown for `Game`, `Both`, `Experimental`, or
+   `Experimental V2`: target
    triangle budget.
 
 Output in `outputs/<name>/`:
@@ -145,6 +146,10 @@ Output in `outputs/<name>/`:
 | `mesh_experimental_quads.obj` | editable quad-dominant experimental mesh |
 | `mesh_experimental_normal.png` | baked high-detail tangent normal map     |
 | `mesh_experimental_report.json` | topology and surface-error measurements |
+| `mesh_experimental_v2.glb` | quality-gated smoother experimental mesh   |
+| `mesh_experimental_v2_quads.obj` | editable V2 quad-dominant mesh        |
+| `mesh_experimental_v2_normal.png` | V2 tangent normal map                  |
+| `mesh_experimental_v2_report.json` | V2 selection and quality measurements |
 
 Multiple views are experimental and memory-sensitive. View 1 drives depth and
 pose; all supplied views are averaged into the Stage 1 and Stage 2 condition
@@ -188,6 +193,13 @@ relief for cracks and other shallow detail. Local transition or repair triangles
 may appear around adaptively refined patches or where multiple source sheets meet
 inside one grid cell; their counts are recorded in the JSON report.
 
+`Experimental V2` starts from the exact quad layout accepted by `Experimental`.
+It evaluates gentle, balanced, and strong smoothing candidates, then keeps a
+candidate only when it improves curved-surface roughness without exceeding the
+source-error, triangle-aspect, volume, or sharp-edge limits. Flat and hard-surface
+objects can intentionally fall back to the unchanged experimental mesh. The V2
+report records the selected profile or each rejection reason.
+
 GLB files are runtime meshes and are stored as triangles. Targets below 500
 faces are rejected to avoid accidentally destroying silhouettes.
 
@@ -212,6 +224,12 @@ Use `auto` instead of a number to pick a target automatically.
 ./run.sh experimental outputs/<name> 2000
 ```
 
+**Create the quality-gated smoother experimental mesh:**
+
+```bash
+./run.sh experimentalv2 outputs/<name> 2000
+```
+
 The face value is the initial runtime-triangle budget. The quality gate may use
 more faces when necessary. Its main limits can be adjusted without changing code:
 
@@ -227,9 +245,12 @@ more faces when necessary. Its main limits can be adjusted without changing code
 | `SAM3D_EXPERIMENTAL_ADAPTIVE_MAX_FRACTION` | `0.12` | maximum fraction of quads selected for local subdivision |
 | `SAM3D_EXPERIMENTAL_ADAPTIVE_ERROR` | `0.10` | local source-error threshold in grid-cell diagonals |
 | `SAM3D_EXPERIMENTAL_ADAPTIVE_ANGLE` | `16` | local source-normal threshold in degrees |
+| `SAM3D_EXPERIMENTAL_ADAPTIVE_MAX_TRANSITION_RATIO` | `0.15` | maximum runtime triangle share used by adaptive transitions |
 | `SAM3D_EXPERIMENTAL_NORMAL_SIZE` | texture size | experimental tangent normal-map resolution |
 | `SAM3D_EXPERIMENTAL_NORMAL_STRENGTH` | `0.35` | high-poly geometric normal contribution |
 | `SAM3D_EXPERIMENTAL_ALBEDO_RELIEF` | `0.08` | subtle high-frequency crack/detail contribution |
+| `SAM3D_EXPERIMENTAL_V2_PROFILES` | `3` | number of V2 smoothing candidates to evaluate |
+| `SAM3D_EXPERIMENTAL_V2_VOLUME_CHANGE` | `0.03` | maximum accepted V2 volume change |
 
 ---
 

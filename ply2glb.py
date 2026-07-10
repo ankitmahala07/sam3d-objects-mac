@@ -6,9 +6,11 @@ Usage:
     python ply2glb.py <output_folder>
     python ply2glb.py --game-ready --target-faces 2000 <output_folder>
     python ply2glb.py --experimental --target-faces 2000 <output_folder>
+    python ply2glb.py --experimental-v2 --target-faces 2000 <output_folder>
     ./run.sh glb <output_folder>
     ./run.sh game <output_folder> [target_faces]
     ./run.sh experimental <output_folder> [target_faces]
+    ./run.sh experimentalv2 <output_folder> [target_faces]
 
 Loads only the mesh decoder (~500 MB), not the full inference pipeline.
 Requires slat.pt and splat.ply to exist in <output_folder>.
@@ -114,9 +116,20 @@ def parse_args():
         help="Create an in-repo quad-dominant experimental mesh, writing mesh_experimental.glb.",
     )
     parser.add_argument(
+        "--experimental-v2",
+        action="store_true",
+        help=(
+            "Quality-gated smoothing for the experimental quad mesh, "
+            "writing mesh_experimental_v2.glb."
+        ),
+    )
+    parser.add_argument(
         "--target-faces",
         default="auto",
-        help="Target triangle count for --game-ready or --experimental. Use 'auto' or an integer >= 500.",
+        help=(
+            "Target triangle count for game or experimental output. "
+            "Use 'auto' or an integer >= 500."
+        ),
     )
     parser.add_argument(
         "--remesh-method",
@@ -187,18 +200,26 @@ def main():
     print(f"\n{BOLD}{W}  ply2glb  ·  Gaussian splat → Textured GLB{RST}")
     args = parse_args()
 
-    if args.game_ready and args.experimental:
-        err("Choose either --game-ready or --experimental, not both.")
+    if args.experimental and args.experimental_v2:
+        err("Choose either --experimental or --experimental-v2, not both.")
+    experimental_mode = args.experimental or args.experimental_v2
+    if args.game_ready and experimental_mode:
+        err("Choose either --game-ready or --experimental/--experimental-v2, not both.")
 
     if not args.folder:
-        print(f"  Usage: {sys.argv[0]} [--game-ready|--experimental --target-faces auto|N] <output_folder>")
+        print(
+            f"  Usage: {sys.argv[0]} "
+            "[--game-ready|--experimental|--experimental-v2 "
+            "--target-faces auto|N] <output_folder>"
+        )
         sys.exit(1)
 
     folder = os.path.abspath(args.folder.strip().strip("'\""))
     ply_path  = os.path.join(folder, "splat.ply")
     slat_path = os.path.join(folder, "slat.pt")
+    experimental_base = "mesh_experimental_v2" if args.experimental_v2 else "mesh_experimental"
     default_name = (
-        "mesh_experimental.glb" if args.experimental
+        f"{experimental_base}.glb" if experimental_mode
         else "mesh_game.glb" if args.game_ready
         else "mesh.glb"
     )
@@ -221,11 +242,14 @@ def main():
     if args.game_ready:
         ok(f"Game-ready remesh: target={target_faces or 'auto'}")
         ok("Game-ready method: quality-safe welded mesh export")
-    elif args.experimental:
+    elif experimental_mode:
         ok(f"Experimental generation: target={target_faces or 'auto'}")
-        ok("Experimental method: adaptive QEF surface + tangent normal detail")
+        ok(
+            "Experimental method: adaptive QEF surface + tangent normal detail"
+            + (" + v2 surface smoothing" if args.experimental_v2 else "")
+        )
     progress = make_progress(
-        extra_units=2 if args.experimental else 1 if args.game_ready else 0
+        extra_units=2 if experimental_mode else 1 if args.game_ready else 0
     )
 
     hdr("LOADING ASSETS")
@@ -281,7 +305,7 @@ def main():
 
     hdr("CLEANUP MESH + BAKE TEXTURE + EXPORT GLB")
     conversion_label = (
-        "Experimental mesh + texture bake" if args.experimental
+        "Experimental mesh + texture bake" if experimental_mode
         else "Game mesh + texture bake" if args.game_ready
         else "Cleanup + texture bake"
     )
@@ -297,21 +321,21 @@ def main():
     experimental_quad_path = None
     experimental_normal_path = None
     export_glb_path = glb_path
-    if args.experimental:
+    if experimental_mode:
         experimental_temp_dir = tempfile.mkdtemp(prefix=".experimental-", dir=folder)
         experimental_quad_path = os.path.join(
             experimental_temp_dir,
-            "mesh_experimental_quads.obj",
+            f"{experimental_base}_quads.obj",
         )
         experimental_normal_path = os.path.join(
             experimental_temp_dir,
-            "mesh_experimental_normal.png",
+            f"{experimental_base}_normal.png",
         )
         export_glb_path = os.path.join(experimental_temp_dir, out_name)
     if on_mps:
         step(
             (
-                "Experimental quad mesh → streamed texture bake " if args.experimental
+                "Experimental quad mesh → streamed texture bake " if experimental_mode
                 else "Welded game mesh → streamed texture bake " if args.game_ready
                 else "Mesh cleanup → streamed texture bake "
             )
@@ -328,7 +352,7 @@ def main():
         glb = to_glb(
             gs,
             mesh_result,
-            simplify=0.0 if (args.game_ready or args.experimental) else 0.90,
+            simplify=0.0 if (args.game_ready or experimental_mode) else 0.90,
             fill_holes=True,
             fill_holes_resolution=512 if on_mps else 1024,
             fill_holes_num_views=100 if on_mps else 1000,
@@ -339,7 +363,8 @@ def main():
             game_target_faces=target_faces,
             game_remesh_method=remesh_method,
             game_retopo_sidecar_path=None,
-            experimental_retopo=args.experimental,
+            experimental_retopo=experimental_mode,
+            experimental_smooth=args.experimental_v2,
             experimental_target_faces=target_faces,
             experimental_quad_path=experimental_quad_path,
             experimental_normal_path=experimental_normal_path,
@@ -352,18 +377,18 @@ def main():
         )
         ok(f"GLB ready  ({time.time()-t0:.1f}s)")
         glb.export(export_glb_path)
-        if args.experimental:
+        if experimental_mode:
             os.replace(
                 experimental_quad_path,
-                os.path.join(folder, "mesh_experimental_quads.obj"),
+                os.path.join(folder, f"{experimental_base}_quads.obj"),
             )
             os.replace(
                 experimental_quad_path.replace("_quads.obj", "_report.json"),
-                os.path.join(folder, "mesh_experimental_report.json"),
+                os.path.join(folder, f"{experimental_base}_report.json"),
             )
             os.replace(
                 experimental_normal_path,
-                os.path.join(folder, "mesh_experimental_normal.png"),
+                os.path.join(folder, f"{experimental_base}_normal.png"),
             )
             os.replace(export_glb_path, glb_path)
     finally:
@@ -375,10 +400,10 @@ def main():
     else:
         progress.close()
     saved(out_name, glb_path)
-    if args.experimental:
-        saved("mesh_experimental_quads.obj", os.path.join(folder, "mesh_experimental_quads.obj"))
-        saved("mesh_experimental_report.json", os.path.join(folder, "mesh_experimental_report.json"))
-        saved("mesh_experimental_normal.png", os.path.join(folder, "mesh_experimental_normal.png"))
+    if experimental_mode:
+        for suffix in ("quads.obj", "report.json", "normal.png"):
+            label = f"{experimental_base}_{suffix}"
+            saved(label, os.path.join(folder, label))
 
     hdr("DONE")
 
