@@ -1004,7 +1004,7 @@ def game_remesh_mesh(
     raise RuntimeError(f"Unsupported game mesh method: {method}")
 
 
-def parametrize_mesh(vertices: np.array, faces: np.array):
+def parametrize_mesh(vertices: np.array, faces: np.array, return_mapping: bool = False):
     """
     Parametrize a mesh to a texture space, using xatlas.
 
@@ -1018,6 +1018,8 @@ def parametrize_mesh(vertices: np.array, faces: np.array):
     vertices = vertices[vmapping]
     faces = indices
 
+    if return_mapping:
+        return vertices, faces, uvs, vmapping
     return vertices, faces, uvs
 
 @torch.inference_mode(False)
@@ -1465,6 +1467,7 @@ def to_glb(
     experimental_retopo: bool = False,
     experimental_target_faces: Optional[int] = None,
     experimental_quad_path: Optional[str] = None,
+    experimental_normal_path: Optional[str] = None,
     debug: bool = False,
     verbose: bool = True,
     with_mesh_postprocess=True,
@@ -1489,10 +1492,16 @@ def to_glb(
     vertices = mesh.vertices.float().cpu().numpy()
     faces = mesh.faces.cpu().numpy()
     vert_colors = mesh.vertex_attrs[:, :3].cpu().numpy()
+    experimental_reference_vertices = None
+    experimental_reference_faces = None
+    experimental_report_stats = None
+    experimental_vertex_normals = None
 
     if experimental_retopo:
         from sam3d_objects.experimental_retopo import retopologize, write_quad_obj
 
+        experimental_reference_vertices = vertices.copy()
+        experimental_reference_faces = faces.copy()
         result = retopologize(
             vertices,
             faces,
@@ -1508,11 +1517,7 @@ def to_glb(
                 result.quads,
                 result.repair_faces,
             )
-            import json
-
-            report_path = experimental_quad_path.replace("_quads.obj", "_report.json")
-            with open(report_path, "w", encoding="ascii") as report_file:
-                json.dump(result.stats, report_file, indent=2)
+        experimental_report_stats = result.stats
         if verbose:
             tqdm.write(
                 "After experimental retopo: "
@@ -1588,7 +1593,16 @@ def to_glb(
 
     if with_texture_baking:
         # parametrize mesh
-        vertices, faces, uvs = parametrize_mesh(vertices, faces)
+        if experimental_retopo:
+            from sam3d_objects.experimental_retopo import smooth_vertex_normals
+
+            pre_uv_normals = smooth_vertex_normals(vertices, faces)
+            vertices, faces, uvs, vmapping = parametrize_mesh(
+                vertices, faces, return_mapping=True
+            )
+            experimental_vertex_normals = pre_uv_normals[vmapping]
+        else:
+            vertices, faces, uvs = parametrize_mesh(vertices, faces)
         logger.info("Baking texture ...")
         _emit_progress(progress_callback, "UV unwrap", 1)
 
@@ -1628,10 +1642,34 @@ def to_glb(
                 rendering_engine=rendering_engine
             )
             _emit_progress(progress_callback, "Texture bake", 3)
+        normal_texture = None
+        if experimental_retopo:
+            from sam3d_objects.experimental_retopo import bake_tangent_normal_map
+
+            normal_size = max(
+                64,
+                int(os.environ.get("SAM3D_EXPERIMENTAL_NORMAL_SIZE", str(texture_size))),
+            )
+            normal_image, normal_stats = bake_tangent_normal_map(
+                experimental_reference_vertices,
+                experimental_reference_faces,
+                vertices,
+                faces,
+                uvs,
+                vertex_normals=experimental_vertex_normals,
+                texture_size=normal_size,
+                base_color=texture,
+                output_path=experimental_normal_path,
+            )
+            normal_texture = Image.fromarray(normal_image)
+            if experimental_report_stats is not None:
+                experimental_report_stats["normal_map"] = normal_stats
+            _emit_progress(progress_callback, "Experimental normal bake", 1)
         texture = Image.fromarray(texture)
         material = trimesh.visual.material.PBRMaterial(
             roughnessFactor=1.0,
             baseColorTexture=texture,
+            normalTexture=normal_texture,
             baseColorFactor=np.array([255, 255, 255, 255], dtype=np.uint8),
         )
 
@@ -1642,15 +1680,28 @@ def to_glb(
         mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
         mesh.visual.vertex_colors = vert_colors
     else:
-        mesh = trimesh.Trimesh(
-            vertices,
-            faces,
-            visual=(
+        mesh_kwargs = {
+            "vertices": vertices,
+            "faces": faces,
+            "visual": (
                 trimesh.visual.TextureVisuals(uv=uvs, material=material)
                 if with_texture_baking
                 else None
             ),
-        )
+        }
+        if experimental_retopo and experimental_vertex_normals is not None:
+            mesh_kwargs["vertex_normals"] = experimental_vertex_normals @ np.array(
+                [[1, 0, 0], [0, 0, -1], [0, 1, 0]]
+            )
+            mesh_kwargs["process"] = False
+        mesh = trimesh.Trimesh(**mesh_kwargs)
+
+    if experimental_quad_path and experimental_report_stats is not None:
+        import json
+
+        report_path = experimental_quad_path.replace("_quads.obj", "_report.json")
+        with open(report_path, "w", encoding="ascii") as report_file:
+            json.dump(experimental_report_stats, report_file, indent=2)
 
     return mesh
 

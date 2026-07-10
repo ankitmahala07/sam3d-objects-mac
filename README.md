@@ -143,6 +143,7 @@ Output in `outputs/<name>/`:
 | `mesh.glb`      | optional unoptimised high-detail textured mesh         |
 | `mesh_experimental.glb` | optional experimental textured runtime mesh    |
 | `mesh_experimental_quads.obj` | editable quad-dominant experimental mesh |
+| `mesh_experimental_normal.png` | baked high-detail tangent normal map     |
 | `mesh_experimental_report.json` | topology and surface-error measurements |
 
 Multiple views are experimental and memory-sensitive. View 1 drives depth and
@@ -173,16 +174,19 @@ the surface with an in-repo signed-distance and QEF dual-contouring implementati
 1. align a bounded grid to the source object's principal frame;
 2. fit one feature-aware vertex per intersected cell;
 3. connect those cells into a regular quad-dominant surface;
-4. relax vertices tangentially and project them back to the untouched source;
-5. repair ambiguous local patches and reject boundary or non-manifold results;
-6. measure bidirectional surface error and raise the grid resolution when the
+4. locally subdivide high-error and curved patches with manifold transition faces;
+5. fair low-curvature regions while locking creases, notches, and thin tips;
+6. repair ambiguous local patches and reject boundary or non-manifold results;
+7. measure bidirectional surface error and raise the grid resolution when the
    requested budget loses too much shape.
 
 No external retopology executable or service is used. The OBJ preserves editable
 quads; the GLB is triangulated for runtime compatibility and receives its texture
-after the experimental topology has been finalized. A small number of local
-repair triangles may appear where multiple source sheets meet inside one grid
-cell; their counts are recorded in the JSON report.
+after the experimental topology has been finalized. It also receives a tangent
+normal map baked from the untouched decoded surface, with subtle appearance-based
+relief for cracks and other shallow detail. Local transition or repair triangles
+may appear around adaptively refined patches or where multiple source sheets meet
+inside one grid cell; their counts are recorded in the JSON report.
 
 GLB files are runtime meshes and are stored as triangles. Targets below 500
 faces are rejected to avoid accidentally destroying silhouettes.
@@ -218,8 +222,14 @@ more faces when necessary. Its main limits can be adjusted without changing code
 | `SAM3D_EXPERIMENTAL_MAX_FACES` | `40000` | hard automatic face ceiling |
 | `SAM3D_EXPERIMENTAL_MAX_AXIS` | `144` | largest signed-distance grid dimension |
 | `SAM3D_EXPERIMENTAL_QUALITY_ATTEMPTS` | `2` | reconstruction attempts before acceptance |
-| `SAM3D_EXPERIMENTAL_MIN_THICKNESS_CELLS` | `16` | minimum grid resolution across open-mesh thickness |
+| `SAM3D_EXPERIMENTAL_MIN_THICKNESS_CELLS` | `16` | minimum global grid resolution across open-mesh thickness |
 | `SAM3D_EXPERIMENTAL_SHELL_BAND` | `0.55` | unsigned shell width in grid-cell units |
+| `SAM3D_EXPERIMENTAL_ADAPTIVE_MAX_FRACTION` | `0.12` | maximum fraction of quads selected for local subdivision |
+| `SAM3D_EXPERIMENTAL_ADAPTIVE_ERROR` | `0.10` | local source-error threshold in grid-cell diagonals |
+| `SAM3D_EXPERIMENTAL_ADAPTIVE_ANGLE` | `16` | local source-normal threshold in degrees |
+| `SAM3D_EXPERIMENTAL_NORMAL_SIZE` | texture size | experimental tangent normal-map resolution |
+| `SAM3D_EXPERIMENTAL_NORMAL_STRENGTH` | `0.35` | high-poly geometric normal contribution |
+| `SAM3D_EXPERIMENTAL_ALBEDO_RELIEF` | `0.08` | subtle high-frequency crack/detail contribution |
 
 ---
 

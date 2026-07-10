@@ -223,8 +223,10 @@ def main():
         ok("Game-ready method: quality-safe welded mesh export")
     elif args.experimental:
         ok(f"Experimental generation: target={target_faces or 'auto'}")
-        ok("Experimental method: in-repo QEF dual contouring")
-    progress = make_progress(extra_units=1 if (args.game_ready or args.experimental) else 0)
+        ok("Experimental method: adaptive QEF surface + tangent normal detail")
+    progress = make_progress(
+        extra_units=2 if args.experimental else 1 if args.game_ready else 0
+    )
 
     hdr("LOADING ASSETS")
     progress("phase", label="Load GLB assets")
@@ -293,12 +295,17 @@ def main():
     texture_size = int_env("SAM3D_TEXTURE_SIZE", 2048)
     experimental_temp_dir = None
     experimental_quad_path = None
+    experimental_normal_path = None
     export_glb_path = glb_path
     if args.experimental:
         experimental_temp_dir = tempfile.mkdtemp(prefix=".experimental-", dir=folder)
         experimental_quad_path = os.path.join(
             experimental_temp_dir,
             "mesh_experimental_quads.obj",
+        )
+        experimental_normal_path = os.path.join(
+            experimental_temp_dir,
+            "mesh_experimental_normal.png",
         )
         export_glb_path = os.path.join(experimental_temp_dir, out_name)
     if on_mps:
@@ -335,6 +342,7 @@ def main():
             experimental_retopo=args.experimental,
             experimental_target_faces=target_faces,
             experimental_quad_path=experimental_quad_path,
+            experimental_normal_path=experimental_normal_path,
             texture_mode="average",  # smooth angle-weighted multi-view average (no Adam patchiness)
             with_mesh_postprocess=True,   # includes floater removal (remove_floaters default on)
             with_texture_baking=True,
@@ -353,6 +361,10 @@ def main():
                 experimental_quad_path.replace("_quads.obj", "_report.json"),
                 os.path.join(folder, "mesh_experimental_report.json"),
             )
+            os.replace(
+                experimental_normal_path,
+                os.path.join(folder, "mesh_experimental_normal.png"),
+            )
             os.replace(export_glb_path, glb_path)
     finally:
         if experimental_temp_dir:
@@ -366,6 +378,7 @@ def main():
     if args.experimental:
         saved("mesh_experimental_quads.obj", os.path.join(folder, "mesh_experimental_quads.obj"))
         saved("mesh_experimental_report.json", os.path.join(folder, "mesh_experimental_report.json"))
+        saved("mesh_experimental_normal.png", os.path.join(folder, "mesh_experimental_normal.png"))
 
     hdr("DONE")
 

@@ -3,5 +3,12 @@ from .dual_contour import (
     retopologize,
     write_quad_obj,
 )
+from .normal_bake import bake_tangent_normal_map, smooth_vertex_normals
 
-__all__ = ["ExperimentalRetopoResult", "retopologize", "write_quad_obj"]
+__all__ = [
+    "ExperimentalRetopoResult",
+    "bake_tangent_normal_map",
+    "retopologize",
+    "smooth_vertex_normals",
+    "write_quad_obj",
+]

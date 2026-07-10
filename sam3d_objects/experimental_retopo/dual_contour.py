@@ -321,16 +321,19 @@ def _signed_from_unsigned(unsigned: np.ndarray, spacing: np.ndarray):
         _env_float("SAM3D_EXPERIMENTAL_MAX_SHELL_BAND", 2.25),
     )
     labels = None
+    best_inside_count = 0
     while barrier_scale <= max_barrier_scale + 1e-6:
         barrier = unsigned <= float(np.max(spacing)) * barrier_scale
         free_space = ~barrier
         outside = _exterior_flood(free_space)
         inside_free = free_space & ~outside
-        if bool(inside_free.any()):
-            labels = np.zeros(unsigned.shape, dtype=np.int8)
-            labels[outside] = 1
-            labels[inside_free] = -1
-            break
+        inside_count = int(inside_free.sum())
+        if inside_count > best_inside_count:
+            candidate = np.zeros(unsigned.shape, dtype=np.int8)
+            candidate[outside] = 1
+            candidate[inside_free] = -1
+            labels = candidate
+            best_inside_count = inside_count
         barrier_scale += 0.4
     if labels is None:
         raise RuntimeError(
@@ -1178,6 +1181,359 @@ def _relax_and_project(vertices, quads, feature_strength, source_scene, spacing)
     return output.astype(np.float32)
 
 
+def _adaptive_refine_quads(
+    vertices,
+    quads,
+    feature_strength,
+    source_scene,
+    spacing,
+    target_faces,
+):
+    enabled = _env_int("SAM3D_EXPERIMENTAL_ADAPTIVE", 1) != 0
+    empty_triangles = np.empty((0, 3), dtype=np.int64)
+    empty_stats = {
+        "adaptive_refined_quads": 0,
+        "adaptive_transition_faces": 0,
+        "adaptive_error_max": 0.0,
+        "adaptive_normal_angle_max": 0.0,
+        "adaptive_rejected": None,
+    }
+    if not enabled or quads.shape[0] < 8:
+        return vertices, quads, empty_triangles, feature_strength, empty_stats
+
+    quad_points = vertices[quads]
+    centers = quad_points.mean(axis=1)
+    edge_midpoints = 0.5 * (quad_points + np.roll(quad_points, -1, axis=1))
+    samples = np.concatenate([centers[:, None, :], edge_midpoints], axis=1)
+    closest, source_normals = _query_closest(source_scene, samples.reshape(-1, 3))
+    closest = closest.reshape(quads.shape[0], 5, 3)
+    source_normals = source_normals.reshape(quads.shape[0], 5, 3)
+
+    cell_diagonal = max(float(np.linalg.norm(spacing)), 1e-8)
+    error = np.linalg.norm(samples - closest, axis=2).max(axis=1) / cell_diagonal
+    quad_normals = np.cross(
+        quad_points[:, 1] - quad_points[:, 0],
+        quad_points[:, 3] - quad_points[:, 0],
+    )
+    normal_lengths = np.linalg.norm(quad_normals, axis=1)
+    valid = normal_lengths > 1e-12
+    quad_normals[valid] /= normal_lengths[valid, None]
+    quad_normals[~valid] = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+    source_lengths = np.linalg.norm(source_normals, axis=2)
+    source_normals /= np.maximum(source_lengths[..., None], 1e-12)
+    agreement = np.abs(
+        np.einsum("fij,fj->fi", source_normals, quad_normals)
+    ).clip(0.0, 1.0)
+    normal_angle = np.degrees(np.arccos(agreement)).max(axis=1)
+
+    if feature_strength.shape[0] == vertices.shape[0]:
+        face_feature = feature_strength[quads].max(axis=1)
+    else:
+        feature_strength = np.zeros(vertices.shape[0], dtype=np.float32)
+        face_feature = np.zeros(quads.shape[0], dtype=np.float32)
+    error_threshold = max(
+        0.01, _env_float("SAM3D_EXPERIMENTAL_ADAPTIVE_ERROR", 0.10)
+    )
+    angle_threshold = max(
+        1.0, _env_float("SAM3D_EXPERIMENTAL_ADAPTIVE_ANGLE", 16.0)
+    )
+    feature_threshold = max(
+        0.01, _env_float("SAM3D_EXPERIMENTAL_ADAPTIVE_FEATURE", 0.28)
+    )
+    error_score = error / error_threshold
+    angle_score = (normal_angle / angle_threshold) * np.clip(
+        error / (error_threshold * 0.5), 0.0, 1.0
+    )
+    feature_score = (face_feature / feature_threshold) * np.clip(
+        error / (error_threshold * 0.35), 0.0, 1.0
+    )
+    score = np.maximum.reduce(
+        [
+            error_score,
+            angle_score,
+            feature_score,
+        ]
+    )
+    candidates = np.flatnonzero(score >= 1.0)
+    if candidates.shape[0] == 0:
+        empty_stats["adaptive_error_max"] = float(error.max(initial=0.0))
+        empty_stats["adaptive_normal_angle_max"] = float(normal_angle.max(initial=0.0))
+        return vertices, quads, empty_triangles, feature_strength, empty_stats
+
+    max_fraction = float(
+        np.clip(_env_float("SAM3D_EXPERIMENTAL_ADAPTIVE_MAX_FRACTION", 0.12), 0.01, 0.75)
+    )
+    max_by_fraction = max(1, int(math.ceil(quads.shape[0] * max_fraction)))
+    base_triangles = quads.shape[0] * 2
+    max_runtime_faces = min(
+        _env_int("SAM3D_EXPERIMENTAL_MAX_FACES", 40_000),
+        max(
+            int(math.ceil(base_triangles * 1.8)),
+            int(max(target_faces, base_triangles) * 1.6),
+        ),
+    )
+    max_by_budget = max(0, (max_runtime_faces - base_triangles) // 10)
+    refine_count = min(candidates.shape[0], max_by_fraction, max_by_budget)
+    if refine_count <= 0:
+        return vertices, quads, empty_triangles, feature_strength, empty_stats
+    order = candidates[np.argsort(score[candidates])[::-1]]
+    marked = np.zeros(quads.shape[0], dtype=bool)
+    marked[order[:refine_count]] = True
+
+    split_edges = set()
+    for quad in quads[marked]:
+        for a, b in zip(quad, np.roll(quad, -1)):
+            split_edges.add((min(int(a), int(b)), max(int(a), int(b))))
+
+    output_vertices = [vertex.copy() for vertex in vertices]
+    output_feature = [float(value) for value in feature_strength]
+    pending_indices = []
+    pending_positions = []
+    pending_blends = []
+    edge_vertices = {}
+
+    def add_projected(position, strength, projection_blend=1.0):
+        index = len(output_vertices)
+        output_vertices.append(np.asarray(position, dtype=np.float32))
+        output_feature.append(float(strength))
+        pending_indices.append(index)
+        pending_positions.append(np.asarray(position, dtype=np.float32))
+        pending_blends.append(float(projection_blend))
+        return index
+
+    for edge in split_edges:
+        a, b = edge
+        edge_vertices[edge] = add_projected(
+            (vertices[a] + vertices[b]) * 0.5,
+            max(float(feature_strength[a]), float(feature_strength[b])),
+            0.65,
+        )
+
+    output_quads = []
+    transition_triangles = []
+    transition_faces = 0
+    for face_index, quad in enumerate(quads):
+        split = []
+        for a, b in zip(quad, np.roll(quad, -1)):
+            split.append(edge_vertices.get((min(int(a), int(b)), max(int(a), int(b)))))
+        if marked[face_index]:
+            center = add_projected(
+                vertices[quad].mean(axis=0),
+                float(feature_strength[quad].max()),
+                0.75,
+            )
+            for corner in range(4):
+                output_quads.append(
+                    [
+                        int(quad[corner]),
+                        int(split[corner]),
+                        center,
+                        int(split[(corner - 1) % 4]),
+                    ]
+                )
+        elif any(value is not None for value in split):
+            transition_faces += 1
+            center = add_projected(
+                vertices[quad].mean(axis=0),
+                float(feature_strength[quad].max()),
+                0.0,
+            )
+            boundary = []
+            for corner in range(4):
+                boundary.append(int(quad[corner]))
+                if split[corner] is not None:
+                    boundary.append(int(split[corner]))
+            for a, b in zip(boundary, np.roll(boundary, -1)):
+                transition_triangles.append([center, int(a), int(b)])
+        else:
+            output_quads.append([int(value) for value in quad])
+
+    output_vertices = np.asarray(output_vertices, dtype=np.float32)
+    output_feature = np.asarray(output_feature, dtype=np.float32)
+    if pending_positions:
+        pending_positions = np.asarray(pending_positions, dtype=np.float32)
+        projected, _ = _query_closest(source_scene, pending_positions)
+        correction = projected - pending_positions
+        lengths = np.linalg.norm(correction, axis=1)
+        projection_limit = cell_diagonal * _env_float(
+            "SAM3D_EXPERIMENTAL_ADAPTIVE_PROJECTION_LIMIT", 0.35
+        )
+        scale = np.minimum(1.0, projection_limit / np.maximum(lengths, 1e-12))
+        blends = np.asarray(pending_blends, dtype=np.float32)
+        output_vertices[np.asarray(pending_indices, dtype=np.int64)] += (
+            correction * scale[:, None] * blends[:, None]
+        )
+
+    stats = {
+        "adaptive_refined_quads": int(refine_count),
+        "adaptive_transition_faces": int(transition_faces),
+        "adaptive_error_max": float(error.max(initial=0.0)),
+        "adaptive_normal_angle_max": float(normal_angle.max(initial=0.0)),
+        "adaptive_rejected": None,
+    }
+    output_quads_array = np.asarray(output_quads, dtype=np.int64).reshape(-1, 4)
+    transition_array = np.asarray(transition_triangles, dtype=np.int64).reshape(-1, 3)
+
+    def quality_summary(summary_vertices, summary_quads, summary_extra):
+        summary_triangles = _triangulate_quads(summary_vertices, summary_quads)
+        if summary_extra.shape[0]:
+            summary_triangles = np.concatenate(
+                [summary_triangles, summary_extra], axis=0
+            )
+        triangle_points = summary_vertices[summary_triangles]
+        edge_lengths = np.stack(
+            [
+                np.linalg.norm(triangle_points[:, 1] - triangle_points[:, 0], axis=1),
+                np.linalg.norm(triangle_points[:, 2] - triangle_points[:, 1], axis=1),
+                np.linalg.norm(triangle_points[:, 0] - triangle_points[:, 2], axis=1),
+            ],
+            axis=1,
+        )
+        longest = edge_lengths.max(axis=1)
+        area_twice = np.linalg.norm(
+            np.cross(
+                triangle_points[:, 1] - triangle_points[:, 0],
+                triangle_points[:, 2] - triangle_points[:, 0],
+            ),
+            axis=1,
+        )
+        height = np.divide(
+            area_twice,
+            longest,
+            out=np.zeros_like(longest),
+            where=longest > 1e-12,
+        )
+        aspect = np.divide(
+            longest,
+            height,
+            out=np.full_like(longest, np.inf),
+            where=height > 1e-12,
+        )
+        summary_mesh = trimesh.Trimesh(
+            vertices=summary_vertices, faces=summary_triangles, process=False
+        )
+        angles = np.degrees(np.asarray(summary_mesh.face_adjacency_angles))
+        median_angle = float(np.percentile(angles, 50)) if angles.shape[0] else 0.0
+        return float(np.max(aspect)), median_angle
+
+    _base_aspect, base_dihedral = quality_summary(
+        vertices, quads, empty_triangles
+    )
+    adaptive_aspect, adaptive_dihedral = quality_summary(
+        output_vertices, output_quads_array, transition_array
+    )
+    aspect_limit = _env_float("SAM3D_EXPERIMENTAL_ADAPTIVE_ASPECT_MAX", 80.0)
+    dihedral_increase = _env_float(
+        "SAM3D_EXPERIMENTAL_ADAPTIVE_DIHEDRAL_INCREASE", 0.75
+    )
+    rejection = None
+    if adaptive_aspect > aspect_limit:
+        rejection = "skinny transition topology"
+    elif adaptive_dihedral > base_dihedral + dihedral_increase:
+        rejection = "median smoothness regression"
+    if rejection is not None:
+        empty_stats.update(
+            {
+                "adaptive_error_max": float(error.max(initial=0.0)),
+                "adaptive_normal_angle_max": float(normal_angle.max(initial=0.0)),
+                "adaptive_rejected": rejection,
+            }
+        )
+        return vertices, quads, empty_triangles, feature_strength[: vertices.shape[0]], empty_stats
+
+    return (
+        output_vertices,
+        output_quads_array,
+        transition_array,
+        output_feature,
+        stats,
+    )
+
+
+def _fair_low_curvature_surface(
+    vertices,
+    quads,
+    extra_triangles,
+    feature_strength,
+    source_scene,
+    spacing,
+):
+    iterations = max(0, _env_int("SAM3D_EXPERIMENTAL_FAIR_ITERS", 3))
+    if iterations == 0:
+        return vertices
+    triangles = _triangulate_quads(vertices, quads)
+    if extra_triangles.shape[0]:
+        triangles = np.concatenate([triangles, extra_triangles], axis=0)
+
+    adjacency = [set() for _ in range(vertices.shape[0])]
+    for quad in quads:
+        for a, b in zip(quad, np.roll(quad, -1)):
+            adjacency[int(a)].add(int(b))
+            adjacency[int(b)].add(int(a))
+    for triangle in extra_triangles:
+        for a, b in zip(triangle, np.roll(triangle, -1)):
+            adjacency[int(a)].add(int(b))
+            adjacency[int(b)].add(int(a))
+
+    points = vertices[triangles]
+    face_normals = np.cross(points[:, 1] - points[:, 0], points[:, 2] - points[:, 0])
+    face_lengths = np.linalg.norm(face_normals, axis=1)
+    valid = face_lengths > 1e-12
+    face_normals[valid] /= face_lengths[valid, None]
+    vertex_normals = _vertex_normals(vertices, triangles)
+    curvature = np.zeros(vertices.shape[0], dtype=np.float32)
+    for corner in range(3):
+        agreement = np.einsum(
+            "ij,ij->i", face_normals, vertex_normals[triangles[:, corner]]
+        ).clip(-1.0, 1.0)
+        angle = np.degrees(np.arccos(agreement))
+        np.maximum.at(curvature, triangles[:, corner], angle)
+    lock_start = _env_float("SAM3D_EXPERIMENTAL_FAIR_LOCK_START", 10.0)
+    lock_end = max(
+        lock_start + 1.0,
+        _env_float("SAM3D_EXPERIMENTAL_FAIR_LOCK_END", 30.0),
+    )
+    curvature_lock = np.clip((curvature - lock_start) / (lock_end - lock_start), 0.0, 1.0)
+    if feature_strength.shape[0] == vertices.shape[0]:
+        qef_lock = np.clip(feature_strength * 1.5, 0.0, 1.0)
+        lock = np.maximum(curvature_lock, qef_lock)
+    else:
+        lock = curvature_lock
+
+    weight = float(np.clip(_env_float("SAM3D_EXPERIMENTAL_FAIR_WEIGHT", 0.18), 0.0, 0.5))
+    projection_limit = float(np.linalg.norm(spacing)) * _env_float(
+        "SAM3D_EXPERIMENTAL_FAIR_PROJECTION_LIMIT", 0.35
+    )
+    output = vertices.copy()
+    for _ in range(iterations):
+        runtime_triangles = _triangulate_quads(output, quads)
+        if extra_triangles.shape[0]:
+            runtime_triangles = np.concatenate([runtime_triangles, extra_triangles], axis=0)
+        normals = _vertex_normals(output, runtime_triangles)
+        candidate = output.copy()
+        for index, neighbors in enumerate(adjacency):
+            if not neighbors:
+                continue
+            neighbor_ids = np.fromiter(neighbors, dtype=np.int64)
+            laplacian = output[neighbor_ids].mean(axis=0) - output[index]
+            tangent = laplacian - normals[index] * np.dot(laplacian, normals[index])
+            candidate[index] += tangent * weight * (1.0 - lock[index])
+
+        closest, _ = _query_closest(source_scene, candidate)
+        correction = closest - candidate
+        lengths = np.linalg.norm(correction, axis=1)
+        scale = np.minimum(1.0, projection_limit / np.maximum(lengths, 1e-12))
+        projection_base = np.clip(
+            _env_float("SAM3D_EXPERIMENTAL_FAIR_PROJECT", 0.10), 0.0, 1.0
+        )
+        projection_feature = np.clip(
+            _env_float("SAM3D_EXPERIMENTAL_FAIR_FEATURE_PROJECT", 0.20), 0.0, 1.0
+        )
+        projection_blend = projection_base + lock * projection_feature
+        output = candidate + correction * scale[:, None] * projection_blend[:, None]
+    return output.astype(np.float32)
+
+
 def _mesh_metrics(vertices, triangles, source_vertices, source_scene, scale):
     edges = np.sort(
         np.concatenate(
@@ -1226,6 +1582,9 @@ def _mesh_metrics(vertices, triangles, source_vertices, source_scene, scale):
     combined = np.concatenate([output_distance, source_distance]) / max(scale, 1e-8)
     runtime_mesh = trimesh.Trimesh(vertices=vertices, faces=triangles, process=False)
     component_count = len(runtime_mesh.split(only_watertight=False))
+    dihedral = np.degrees(np.asarray(runtime_mesh.face_adjacency_angles))
+    if dihedral.shape[0] == 0:
+        dihedral = np.zeros(1, dtype=np.float32)
 
     return {
         "vertices": int(vertices.shape[0]),
@@ -1238,6 +1597,8 @@ def _mesh_metrics(vertices, triangles, source_vertices, source_scene, scale):
         "aspect_max": float(np.max(aspect)),
         "surface_error_p95": float(np.percentile(combined, 95)),
         "surface_error_max": float(np.max(combined)),
+        "dihedral_p50": float(np.percentile(dihedral, 50)),
+        "dihedral_p95": float(np.percentile(dihedral, 95)),
     }, triangles
 
 
@@ -1334,6 +1695,42 @@ def _build_once(
         split_vertices = 0
         repair_splits = 0
         mode = "marching-tetrahedra"
+
+    adaptive_stats = {
+        "adaptive_refined_quads": 0,
+        "adaptive_transition_faces": 0,
+        "adaptive_error_max": 0.0,
+        "adaptive_normal_angle_max": 0.0,
+        "adaptive_rejected": None,
+    }
+    if mode == "qef-dual-contour" and repair_faces.shape[0] == 0:
+        (
+            vertices,
+            quads,
+            adaptive_triangles,
+            feature_strength,
+            adaptive_stats,
+        ) = _adaptive_refine_quads(
+            vertices,
+            quads,
+            feature_strength,
+            source_scene,
+            sampled_spacing,
+            target_faces,
+        )
+        if adaptive_triangles.shape[0]:
+            repair_faces = adaptive_triangles
+        if adaptive_stats["adaptive_refined_quads"]:
+            mode = "adaptive-qef-dual-contour"
+
+    vertices = _fair_low_curvature_surface(
+        vertices,
+        quads,
+        repair_faces,
+        feature_strength,
+        source_scene,
+        sampled_spacing,
+    )
     quads, repair_faces = _orient_connected_polygons(
         vertices,
         quads,
@@ -1350,6 +1747,7 @@ def _build_once(
         repair_splits,
         mode,
         tuple(int(value) for value in dims),
+        adaptive_stats,
     )
 
 
@@ -1408,6 +1806,7 @@ def retopologize(
             repair_splits,
             mode,
             grid,
+            adaptive_stats,
         ) = _build_once(
             local_vertices,
             source_faces,
@@ -1436,6 +1835,7 @@ def retopologize(
                 "target_faces": int(effective_target),
                 "grid": grid,
                 "removed_components": int(removed_components),
+                **adaptive_stats,
             }
         )
         attempt_stats.append(metrics)

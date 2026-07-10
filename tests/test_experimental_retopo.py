@@ -1,7 +1,13 @@
+import os
+
 import numpy as np
 import trimesh
 
-from sam3d_objects.experimental_retopo import retopologize, write_quad_obj
+from sam3d_objects.experimental_retopo import (
+    bake_tangent_normal_map,
+    retopologize,
+    write_quad_obj,
+)
 
 
 def _assert_manifold_result(result):
@@ -25,14 +31,15 @@ def test_hard_surface_grid_preserves_planes(tmp_path):
     )
 
     _assert_manifold_result(result)
-    assert result.repair_faces.shape[0] == 0
     assert result.stats["aspect_p95"] < 3.0
+    assert result.stats["dihedral_p50"] < 1.0
+    assert "adaptive_rejected" in result.stats
 
     path = tmp_path / "grid.obj"
     write_quad_obj(path, result.vertices, result.quads, result.repair_faces)
     face_lines = [line for line in path.read_text("ascii").splitlines() if line.startswith("f ")]
-    assert len(face_lines) == result.quads.shape[0]
-    assert all(len(line.split()) == 5 for line in face_lines)
+    assert len(face_lines) == result.quads.shape[0] + result.repair_faces.shape[0]
+    assert sum(len(line.split()) == 5 for line in face_lines) == result.quads.shape[0]
 
 
 def test_curved_surface_is_watertight():
@@ -44,8 +51,38 @@ def test_curved_surface_is_watertight():
     )
 
     _assert_manifold_result(result)
+    assert "adaptive_rejected" in result.stats
+    assert result.stats["dihedral_p95"] < 15.0
     runtime = trimesh.Trimesh(result.vertices, result.faces, process=False)
     assert runtime.is_watertight
+
+
+def test_adaptive_curved_patch_stays_manifold():
+    names = {
+        "SAM3D_EXPERIMENTAL_ADAPTIVE_ERROR": "0.03",
+        "SAM3D_EXPERIMENTAL_ADAPTIVE_MAX_FRACTION": "0.05",
+        "SAM3D_EXPERIMENTAL_ADAPTIVE_DIHEDRAL_INCREASE": "2",
+    }
+    previous = {name: os.environ.get(name) for name in names}
+    os.environ.update(names)
+    try:
+        source = trimesh.creation.icosphere(subdivisions=3, radius=1.0)
+        result = retopologize(
+            np.asarray(source.vertices),
+            np.asarray(source.faces),
+            target_faces=800,
+        )
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    _assert_manifold_result(result)
+    assert result.stats["adaptive_refined_quads"] > 0
+    assert result.stats["adaptive_transition_faces"] > 0
+    assert result.stats["adaptive_rejected"] is None
 
 
 def test_open_multishell_source_becomes_one_body():
@@ -65,3 +102,42 @@ def test_open_multishell_source_becomes_one_body():
     assert result.stats["removed_source_components"] == 1
     runtime = trimesh.Trimesh(result.vertices, result.faces, process=False)
     assert len(runtime.split(only_watertight=False)) == 1
+
+
+def test_normal_bake_transfers_reference_curvature(tmp_path):
+    axis = np.linspace(-1.0, 1.0, 17, dtype=np.float32)
+    xx, yy = np.meshgrid(axis, axis, indexing="xy")
+    zz = 0.12 * np.exp(-5.0 * (xx * xx + yy * yy))
+    source_vertices = np.stack([xx, yy, zz], axis=-1).reshape(-1, 3)
+    source_faces = []
+    width = axis.shape[0]
+    for y in range(width - 1):
+        for x in range(width - 1):
+            a = y * width + x
+            b = a + 1
+            c = a + width
+            d = c + 1
+            source_faces.extend([(a, b, d), (a, d, c)])
+
+    vertices = np.asarray(
+        [[-1, -1, 0], [1, -1, 0], [1, 1, 0], [-1, 1, 0]],
+        dtype=np.float32,
+    )
+    faces = np.asarray([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
+    uvs = np.asarray([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=np.float32)
+    output_path = tmp_path / "normal.png"
+    image, stats = bake_tangent_normal_map(
+        source_vertices,
+        np.asarray(source_faces, dtype=np.int64),
+        vertices,
+        faces,
+        uvs,
+        texture_size=96,
+        output_path=output_path,
+    )
+
+    assert output_path.is_file()
+    assert image.shape == (96, 96, 3)
+    assert stats["coverage"] > 0.95
+    assert stats["detail_angle_p95"] > 0.5
+    assert np.std(image[..., :2].astype(np.float32)) > 1.0
