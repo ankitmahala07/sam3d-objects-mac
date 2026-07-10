@@ -1462,6 +1462,9 @@ def to_glb(
     game_target_faces: Optional[int] = None,
     game_remesh_method: str = "quality",
     game_retopo_sidecar_path: Optional[str] = None,
+    experimental_retopo: bool = False,
+    experimental_target_faces: Optional[int] = None,
+    experimental_quad_path: Optional[str] = None,
     debug: bool = False,
     verbose: bool = True,
     with_mesh_postprocess=True,
@@ -1487,7 +1490,40 @@ def to_glb(
     faces = mesh.faces.cpu().numpy()
     vert_colors = mesh.vertex_attrs[:, :3].cpu().numpy()
 
-    if game_remesh:
+    if experimental_retopo:
+        from sam3d_objects.experimental_retopo import retopologize, write_quad_obj
+
+        result = retopologize(
+            vertices,
+            faces,
+            target_faces=experimental_target_faces,
+            verbose=verbose,
+        )
+        vertices, faces = result.vertices, result.faces
+        if experimental_quad_path:
+            export_rotation = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
+            write_quad_obj(
+                experimental_quad_path,
+                result.vertices @ export_rotation,
+                result.quads,
+                result.repair_faces,
+            )
+            import json
+
+            report_path = experimental_quad_path.replace("_quads.obj", "_report.json")
+            with open(report_path, "w", encoding="ascii") as report_file:
+                json.dump(result.stats, report_file, indent=2)
+        if verbose:
+            tqdm.write(
+                "After experimental retopo: "
+                f"{result.vertices.shape[0]:,} vertices / "
+                f"{result.quads.shape[0]:,} quads + "
+                f"{result.repair_faces.shape[0]:,} repair triangles / "
+                f"{result.faces.shape[0]:,} runtime triangles"
+            )
+        _emit_progress(progress_callback, "Experimental retopo", 1)
+
+    elif game_remesh:
         if with_mesh_postprocess:
             source_face_count = int(faces.shape[0])
             preclean_limit = _game_preclean_limit()

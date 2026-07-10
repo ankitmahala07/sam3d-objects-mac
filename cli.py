@@ -49,7 +49,7 @@ def int_env(name, default=0):
 
 
 def export_progress_units(mode):
-    if mode == "game":
+    if mode in ("game", "experimental"):
         return 11
     if mode == "both":
         return 21
@@ -174,7 +174,7 @@ def _multi_view_note(image_views):
 
 
 def _image_extract_step(export_mode):
-    return "STEP 6" if export_mode in ("game", "both") else "STEP 5"
+    return "STEP 6" if export_mode in ("game", "both", "experimental") else "STEP 5"
 
 
 def _run_rembg(image_views, export_mode):
@@ -266,8 +266,9 @@ def get_export_mode():
     print(f"     {G}▶{RST} [1] Game        ·  welded low-poly game mesh (default)")
     print(f"       [2] Unoptimised ·  original high-detail mesh")
     print(f"       [3] Both        ·  mesh_game.glb + mesh.glb")
+    print(f"       [4] Experimental ·  in-repo quad-dominant retopology")
     while True:
-        raw = ask("Enter 1–3", 1)
+        raw = ask("Enter 1–4", 1)
         if raw == "1":
             ok("Game output → mesh_game.glb")
             return "game"
@@ -277,16 +278,24 @@ def get_export_mode():
         if raw == "3":
             ok("Both outputs → mesh_game.glb and mesh.glb")
             return "both"
-        err("Enter a number between 1 and 3.")
+        if raw == "4":
+            ok("Experimental output → mesh_experimental.glb + mesh_experimental_quads.obj")
+            return "experimental"
+        err("Enter a number between 1 and 4.")
 
 
 def get_game_options(export_mode):
-    if export_mode not in ("game", "both"):
+    if export_mode not in ("game", "both", "experimental"):
         return "auto", "quality"
 
-    hdr("STEP 5 — GAME MESH")
-    print(f"  {B}?{RST}  Target triangle budget for the game mesh")
-    print(f"       The exporter may keep more faces when needed to preserve the object.")
+    if export_mode == "experimental":
+        hdr("STEP 5 — EXPERIMENTAL GENERATION")
+        print(f"  {B}?{RST}  Initial triangle budget for experimental retopology")
+        print(f"       The quality gate may raise this budget to preserve the source surface.")
+    else:
+        hdr("STEP 5 — GAME MESH")
+        print(f"  {B}?{RST}  Target triangle budget for the game mesh")
+        print(f"       The exporter may keep more faces when needed to preserve the object.")
     print(f"       Examples: 2000 for simple props, 10000 for complex objects")
     while True:
         target = ask("Target faces, or auto", "auto").strip().lower()
@@ -296,6 +305,9 @@ def get_game_options(export_mode):
             break
         err("Enter auto or a number >= 500.")
 
+    if export_mode == "experimental":
+        ok(f"Experimental generation: quad-dominant target={target}")
+        return target, "experimental"
     ok(f"Game mesh: welded quality-safe target={target}")
     return target, "quality"
 

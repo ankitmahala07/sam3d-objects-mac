@@ -5,14 +5,16 @@ ply2glb — Convert a SAM-3D gaussian splat to a textured GLB mesh.
 Usage:
     python ply2glb.py <output_folder>
     python ply2glb.py --game-ready --target-faces 2000 <output_folder>
+    python ply2glb.py --experimental --target-faces 2000 <output_folder>
     ./run.sh glb <output_folder>
     ./run.sh game <output_folder> [target_faces]
+    ./run.sh experimental <output_folder> [target_faces]
 
 Loads only the mesh decoder (~500 MB), not the full inference pipeline.
 Requires slat.pt and splat.ply to exist in <output_folder>.
 """
 
-import sys, os, time, argparse, gc
+import sys, os, time, argparse, gc, shutil, tempfile
 import torch
 import numpy as np
 from sam3d_progress import CliProgress
@@ -107,9 +109,14 @@ def parse_args():
         help="Create a quality-safe game mesh before UV unwrap and texture baking, writing mesh_game.glb.",
     )
     parser.add_argument(
+        "--experimental",
+        action="store_true",
+        help="Create an in-repo quad-dominant experimental mesh, writing mesh_experimental.glb.",
+    )
+    parser.add_argument(
         "--target-faces",
         default="auto",
-        help="Target triangle count for --game-ready. Use 'auto' or an integer >= 500.",
+        help="Target triangle count for --game-ready or --experimental. Use 'auto' or an integer >= 500.",
     )
     parser.add_argument(
         "--remesh-method",
@@ -180,14 +187,22 @@ def main():
     print(f"\n{BOLD}{W}  ply2glb  ·  Gaussian splat → Textured GLB{RST}")
     args = parse_args()
 
+    if args.game_ready and args.experimental:
+        err("Choose either --game-ready or --experimental, not both.")
+
     if not args.folder:
-        print(f"  Usage: {sys.argv[0]} [--game-ready --target-faces auto|N] <output_folder>")
+        print(f"  Usage: {sys.argv[0]} [--game-ready|--experimental --target-faces auto|N] <output_folder>")
         sys.exit(1)
 
     folder = os.path.abspath(args.folder.strip().strip("'\""))
     ply_path  = os.path.join(folder, "splat.ply")
     slat_path = os.path.join(folder, "slat.pt")
-    out_name = args.output or ("mesh_game.glb" if args.game_ready else "mesh.glb")
+    default_name = (
+        "mesh_experimental.glb" if args.experimental
+        else "mesh_game.glb" if args.game_ready
+        else "mesh.glb"
+    )
+    out_name = args.output or default_name
     glb_path  = os.path.join(folder, out_name)
     target_faces = parse_target_faces(args.target_faces)
     remesh_method = parse_remesh_method(args.remesh_method)
@@ -206,7 +221,10 @@ def main():
     if args.game_ready:
         ok(f"Game-ready remesh: target={target_faces or 'auto'}")
         ok("Game-ready method: quality-safe welded mesh export")
-    progress = make_progress(extra_units=1 if args.game_ready else 0)
+    elif args.experimental:
+        ok(f"Experimental generation: target={target_faces or 'auto'}")
+        ok("Experimental method: in-repo QEF dual contouring")
+    progress = make_progress(extra_units=1 if (args.game_ready or args.experimental) else 0)
 
     hdr("LOADING ASSETS")
     progress("phase", label="Load GLB assets")
@@ -260,7 +278,12 @@ def main():
             "Re-run the CLI to regenerate this object before converting to GLB.")
 
     hdr("CLEANUP MESH + BAKE TEXTURE + EXPORT GLB")
-    progress("phase", label="Game mesh + texture bake" if args.game_ready else "Cleanup + texture bake")
+    conversion_label = (
+        "Experimental mesh + texture bake" if args.experimental
+        else "Game mesh + texture bake" if args.game_ready
+        else "Cleanup + texture bake"
+    )
+    progress("phase", label=conversion_label)
     t0 = time.time()
     from sam3d_objects.model.backbone.tdfy_dit.utils.postprocessing_utils import to_glb
     import torch as _t
@@ -268,9 +291,23 @@ def main():
     texture_views = int_env("SAM3D_TEXTURE_VIEWS", 100)
     texture_render_resolution = int_env("SAM3D_TEXTURE_RENDER_RES", 1024)
     texture_size = int_env("SAM3D_TEXTURE_SIZE", 2048)
+    experimental_temp_dir = None
+    experimental_quad_path = None
+    export_glb_path = glb_path
+    if args.experimental:
+        experimental_temp_dir = tempfile.mkdtemp(prefix=".experimental-", dir=folder)
+        experimental_quad_path = os.path.join(
+            experimental_temp_dir,
+            "mesh_experimental_quads.obj",
+        )
+        export_glb_path = os.path.join(experimental_temp_dir, out_name)
     if on_mps:
         step(
-            ("Welded game mesh → streamed texture bake " if args.game_ready else "Mesh cleanup → streamed texture bake ")
+            (
+                "Experimental quad mesh → streamed texture bake " if args.experimental
+                else "Welded game mesh → streamed texture bake " if args.game_ready
+                else "Mesh cleanup → streamed texture bake "
+            )
             + f"({texture_views} views @ {texture_render_resolution}px, {texture_size}px atlas)…"
         )
     else:
@@ -280,36 +317,55 @@ def main():
     #     software mesh raster instead of nvdiffrast)
     #   - texture baking: gsplat_silicon multi-view render + z-buffered UV raster + grid_sample
     # fill_holes views/resolution are reduced on MPS so the software rasterizer stays tractable.
-    glb = to_glb(
-        gs,
-        mesh_result,
-        simplify=0.0 if args.game_ready else 0.90,
-        fill_holes=True,
-        fill_holes_resolution=512 if on_mps else 1024,
-        fill_holes_num_views=100 if on_mps else 1000,
-        texture_size=texture_size,
-        texture_views=texture_views,
-        texture_render_resolution=texture_render_resolution,
-        game_remesh=args.game_ready,
-        game_target_faces=target_faces,
-        game_remesh_method=remesh_method,
-        game_retopo_sidecar_path=None,
-        texture_mode="average",  # smooth angle-weighted multi-view average (no Adam patchiness)
-        with_mesh_postprocess=True,   # includes floater removal (remove_floaters default on)
-        with_texture_baking=True,
-        use_vertex_color=False,
-        rendering_engine="pytorch3d",
-        progress_callback=progress,
-    )
-    ok(f"GLB ready  ({time.time()-t0:.1f}s)")
-
-    glb.export(glb_path)
+    try:
+        glb = to_glb(
+            gs,
+            mesh_result,
+            simplify=0.0 if (args.game_ready or args.experimental) else 0.90,
+            fill_holes=True,
+            fill_holes_resolution=512 if on_mps else 1024,
+            fill_holes_num_views=100 if on_mps else 1000,
+            texture_size=texture_size,
+            texture_views=texture_views,
+            texture_render_resolution=texture_render_resolution,
+            game_remesh=args.game_ready,
+            game_target_faces=target_faces,
+            game_remesh_method=remesh_method,
+            game_retopo_sidecar_path=None,
+            experimental_retopo=args.experimental,
+            experimental_target_faces=target_faces,
+            experimental_quad_path=experimental_quad_path,
+            texture_mode="average",  # smooth angle-weighted multi-view average (no Adam patchiness)
+            with_mesh_postprocess=True,   # includes floater removal (remove_floaters default on)
+            with_texture_baking=True,
+            use_vertex_color=False,
+            rendering_engine="pytorch3d",
+            progress_callback=progress,
+        )
+        ok(f"GLB ready  ({time.time()-t0:.1f}s)")
+        glb.export(export_glb_path)
+        if args.experimental:
+            os.replace(
+                experimental_quad_path,
+                os.path.join(folder, "mesh_experimental_quads.obj"),
+            )
+            os.replace(
+                experimental_quad_path.replace("_quads.obj", "_report.json"),
+                os.path.join(folder, "mesh_experimental_report.json"),
+            )
+            os.replace(export_glb_path, glb_path)
+    finally:
+        if experimental_temp_dir:
+            shutil.rmtree(experimental_temp_dir, ignore_errors=True)
     progress.advance("Export GLB", 1)
     if bool_env("SAM3D_PROGRESS_FINISH", True):
         progress.finish("Complete")
     else:
         progress.close()
     saved(out_name, glb_path)
+    if args.experimental:
+        saved("mesh_experimental_quads.obj", os.path.join(folder, "mesh_experimental_quads.obj"))
+        saved("mesh_experimental_report.json", os.path.join(folder, "mesh_experimental_report.json"))
 
     hdr("DONE")
 

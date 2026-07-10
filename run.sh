@@ -4,6 +4,7 @@
 #   ./run.sh            image → gaussian splat → chosen textured GLB output
 #   ./run.sh glb <dir>  re-convert one output dir's splat.ply → mesh.glb
 #   ./run.sh game <dir> [faces]  create mesh_game.glb with a pre-bake game mesh
+#   ./run.sh experimental <dir> [faces]  create the separate experimental mesh
 #
 # The full flow runs in two separate processes on purpose: the CLI generates the
 # splat and then EXITS, so macOS reclaims all of its model memory before the GLB
@@ -120,12 +121,23 @@ if [[ "$1" == "game" || "$1" == "remesh" ]]; then
         "${2:-}"
 fi
 
+# --- experimental: custom quad-dominant retopology from an existing splat -------
+if [[ "$1" == "experimental" ]]; then
+    check_models
+    wait_for_memory 12
+    exec "$PY" "$SCRIPT_DIR/ply2glb.py" \
+        --experimental \
+        --target-faces "${3:-auto}" \
+        "${2:-}"
+fi
+
 # Only "", "full" run the full flow; anything else is a mistake — show usage.
 if [[ -n "$1" && "$1" != "full" ]]; then
     echo "Usage:"
     echo "  ./run.sh [full]               image -> gaussian splat -> textured GLB"
     echo "  ./run.sh glb <dir>            re-convert splat.ply -> mesh.glb"
     echo "  ./run.sh game <dir> [faces]   pre-bake welded game mesh -> mesh_game.glb"
+    echo "  ./run.sh experimental <dir> [faces]  custom quad mesh -> mesh_experimental.glb"
     exit 1
 fi
 
@@ -170,6 +182,13 @@ while IFS=$'\t' read -r objdir progress_done progress_total export_mode game_tar
             --game-ready \
             --target-faces "$game_target" \
             --remesh-method "$game_method" \
+            "$objdir"
+    elif [[ "$export_mode" == "experimental" ]]; then
+        SAM3D_PROGRESS_DONE="${progress_done:-0}" \
+        SAM3D_PROGRESS_TOTAL="${progress_total:-0}" \
+        "$PY" "$SCRIPT_DIR/ply2glb.py" \
+            --experimental \
+            --target-faces "$game_target" \
             "$objdir"
     elif [[ "$export_mode" == "unoptimised" || "$export_mode" == "unoptimized" ]]; then
         SAM3D_PROGRESS_DONE="${progress_done:-0}" \

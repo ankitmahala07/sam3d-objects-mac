@@ -126,9 +126,9 @@ and GLB output mode, then runs end to end:
 3. **Quality** — diffusion steps for both stages:
    `Low = 10` (default), `Medium = 25`, `High = 50`, or a custom value.
 4. **GLB output** — choose the generated mesh export:
-   `Game` (default), `Unoptimised`, or `Both`.
-5. **Game mesh settings** — shown only for `Game` or `Both`: target triangle
-   budget.
+   `Game` (default), `Unoptimised`, `Both`, or `Experimental`.
+5. **Mesh settings** — shown for `Game`, `Both`, or `Experimental`: target
+   triangle budget.
 
 Output in `outputs/<name>/`:
 
@@ -141,6 +141,9 @@ Output in `outputs/<name>/`:
 | `slat.pt`       | the sparse latent (input to the mesh decoder)          |
 | `mesh_game.glb` | optional/default game-oriented low-poly textured mesh  |
 | `mesh.glb`      | optional unoptimised high-detail textured mesh         |
+| `mesh_experimental.glb` | optional experimental textured runtime mesh    |
+| `mesh_experimental_quads.obj` | editable quad-dominant experimental mesh |
+| `mesh_experimental_report.json` | topology and surface-error measurements |
 
 Multiple views are experimental and memory-sensitive. View 1 drives depth and
 pose; all supplied views are averaged into the Stage 1 and Stage 2 condition
@@ -164,6 +167,23 @@ assets.
 `Both` creates `mesh_game.glb` first and then `mesh.glb` for side-by-side
 comparison.
 
+The separate `Experimental` export does not use the game remesher. It rebuilds
+the surface with an in-repo signed-distance and QEF dual-contouring implementation:
+
+1. align a bounded grid to the source object's principal frame;
+2. fit one feature-aware vertex per intersected cell;
+3. connect those cells into a regular quad-dominant surface;
+4. relax vertices tangentially and project them back to the untouched source;
+5. repair ambiguous local patches and reject boundary or non-manifold results;
+6. measure bidirectional surface error and raise the grid resolution when the
+   requested budget loses too much shape.
+
+No external retopology executable or service is used. The OBJ preserves editable
+quads; the GLB is triangulated for runtime compatibility and receives its texture
+after the experimental topology has been finalized. A small number of local
+repair triangles may appear where multiple source sheets meet inside one grid
+cell; their counts are recorded in the JSON report.
+
 GLB files are runtime meshes and are stored as triangles. Targets below 500
 faces are rejected to avoid accidentally destroying silhouettes.
 
@@ -181,6 +201,25 @@ faces are rejected to avoid accidentally destroying silhouettes.
 ```
 
 Use `auto` instead of a number to pick a target automatically.
+
+**Create only the separate experimental mesh** from an existing result folder:
+
+```bash
+./run.sh experimental outputs/<name> 2000
+```
+
+The face value is the initial runtime-triangle budget. The quality gate may use
+more faces when necessary. Its main limits can be adjusted without changing code:
+
+| Variable | Default | Purpose |
+|----------|--------:|---------|
+| `SAM3D_EXPERIMENTAL_ERROR_P95` | `0.015` | allowed p95 surface error as a fraction of object bounds |
+| `SAM3D_EXPERIMENTAL_MAX_TARGET_MULT` | `4` | maximum automatic budget increase |
+| `SAM3D_EXPERIMENTAL_MAX_FACES` | `40000` | hard automatic face ceiling |
+| `SAM3D_EXPERIMENTAL_MAX_AXIS` | `144` | largest signed-distance grid dimension |
+| `SAM3D_EXPERIMENTAL_QUALITY_ATTEMPTS` | `2` | reconstruction attempts before acceptance |
+| `SAM3D_EXPERIMENTAL_MIN_THICKNESS_CELLS` | `16` | minimum grid resolution across open-mesh thickness |
+| `SAM3D_EXPERIMENTAL_SHELL_BAND` | `0.55` | unsigned shell width in grid-cell units |
 
 ---
 
@@ -251,7 +290,7 @@ when it exits.
 ```
  ┌── Stage 1: cli.py ───────────────┐        ┌── Stage 2: ply2glb.py ───────┐
  │  photo → rembg mask              │        │  slat.pt → mesh decoder      │
- │  → sparse-structure diffusion    │  exit  │  → welded game mesh          │
+ │  → sparse-structure diffusion    │  exit  │  → selected mesh generation  │
  │  → SLAT diffusion                │ ─────▶ │  → multi-view texture bake   │
  │  → gaussian splat  (splat.ply)   │ (frees │  → textured mesh.glb         │
  │  → sparse latent   (slat.pt)     │  mem)  │                              │
