@@ -32,6 +32,54 @@ def smooth_vertex_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray
     return normals
 
 
+def split_vertices_by_crease(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    crease_angle: Optional[float] = None,
+):
+    """Create render-only smoothing groups without changing the geometric surface."""
+    vertices = np.asarray(vertices, dtype=np.float32)
+    faces = np.asarray(faces, dtype=np.int64)
+    if faces.shape[0] == 0:
+        return vertices.copy(), faces.copy(), np.zeros_like(vertices)
+    if crease_angle is None:
+        crease_angle = _env_float("SAM3D_EXPERIMENTAL_NORMAL_CREASE", 50.0)
+
+    corner_vertices = faces.reshape(-1)
+    parent = np.arange(corner_vertices.shape[0], dtype=np.int64)
+
+    def find(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(a, b):
+        root_a = find(a)
+        root_b = find(b)
+        if root_a != root_b:
+            parent[root_b] = root_a
+
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    adjacency = np.asarray(mesh.face_adjacency, dtype=np.int64)
+    edges = np.asarray(mesh.face_adjacency_edges, dtype=np.int64)
+    angles = np.degrees(np.asarray(mesh.face_adjacency_angles))
+    for (face_a, face_b), edge, angle in zip(adjacency, edges, angles):
+        if not np.isfinite(angle) or angle > crease_angle:
+            continue
+        for vertex in edge:
+            corner_a = int(face_a) * 3 + int(np.flatnonzero(faces[face_a] == vertex)[0])
+            corner_b = int(face_b) * 3 + int(np.flatnonzero(faces[face_b] == vertex)[0])
+            union(corner_a, corner_b)
+
+    roots = np.asarray([find(index) for index in range(parent.shape[0])], dtype=np.int64)
+    _, inverse = np.unique(roots, return_inverse=True)
+    split_vertices = vertices[corner_vertices[np.unique(roots, return_index=True)[1]]]
+    split_faces = inverse.reshape(-1, 3).astype(np.int64)
+    split_normals = smooth_vertex_normals(split_vertices, split_faces)
+    return split_vertices.astype(np.float32), split_faces, split_normals
+
+
 def _clean_reference(vertices: np.ndarray, faces: np.ndarray) -> trimesh.Trimesh:
     vertices = np.asarray(vertices, dtype=np.float64)
     faces = np.asarray(faces, dtype=np.int64)

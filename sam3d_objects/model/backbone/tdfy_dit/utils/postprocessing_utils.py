@@ -1604,9 +1604,9 @@ def to_glb(
     if with_texture_baking:
         # parametrize mesh
         if experimental_retopo:
-            from sam3d_objects.experimental_retopo import smooth_vertex_normals
+            from sam3d_objects.experimental_retopo import split_vertices_by_crease
 
-            pre_uv_normals = smooth_vertex_normals(vertices, faces)
+            vertices, faces, pre_uv_normals = split_vertices_by_crease(vertices, faces)
             vertices, faces, uvs, vmapping = parametrize_mesh(
                 vertices, faces, return_mapping=True
             )
@@ -1671,7 +1671,12 @@ def to_glb(
                 base_color=texture,
                 output_path=experimental_normal_path,
             )
-            normal_texture = Image.fromarray(normal_image)
+            attach_normal = os.environ.get(
+                "SAM3D_EXPERIMENTAL_ATTACH_NORMAL_MAP", "0"
+            ).strip().lower() in ("1", "true", "yes", "on")
+            normal_stats["attached"] = attach_normal
+            if attach_normal:
+                normal_texture = Image.fromarray(normal_image)
             if experimental_report_stats is not None:
                 experimental_report_stats["normal_map"] = normal_stats
             _emit_progress(progress_callback, "Experimental normal bake", 1)

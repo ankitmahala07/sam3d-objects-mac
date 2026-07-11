@@ -6,6 +6,7 @@ import trimesh
 from sam3d_objects.experimental_retopo import (
     bake_tangent_normal_map,
     retopologize,
+    split_vertices_by_crease,
     write_quad_obj,
 )
 
@@ -186,3 +187,21 @@ def test_normal_bake_transfers_reference_curvature(tmp_path):
     assert stats["coverage"] > 0.95
     assert stats["detail_angle_p95"] > 0.5
     assert np.std(image[..., :2].astype(np.float32)) > 1.0
+
+
+def test_render_normals_split_hard_creases():
+    source = trimesh.creation.box(extents=[2.0, 1.0, 0.7])
+    vertices, faces, normals = split_vertices_by_crease(
+        np.asarray(source.vertices),
+        np.asarray(source.faces),
+        crease_angle=45.0,
+    )
+
+    assert vertices.shape[0] == 24
+    points = vertices[faces]
+    face_normals = np.cross(points[:, 1] - points[:, 0], points[:, 2] - points[:, 0])
+    face_normals /= np.linalg.norm(face_normals, axis=1)[:, None]
+    corner_dots = np.concatenate(
+        [np.einsum("ij,ij->i", normals[faces[:, corner]], face_normals) for corner in range(3)]
+    )
+    assert np.min(corner_dots) > 0.999
