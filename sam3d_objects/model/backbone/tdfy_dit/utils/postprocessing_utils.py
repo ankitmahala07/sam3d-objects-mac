@@ -1503,12 +1503,20 @@ def to_glb(
 
         experimental_reference_vertices = vertices.copy()
         experimental_reference_faces = faces.copy()
+        splat_points = app_rep.get_xyz.detach().float().cpu().numpy()
+        splat_scales = app_rep.get_scaling.detach().float().cpu().numpy()
+        splat_rotations = app_rep.get_rotation.detach().float().cpu().numpy()
+        splat_opacity = app_rep.get_opacity.detach().float().cpu().numpy()
         result = retopologize(
             vertices,
             faces,
             target_faces=experimental_target_faces,
             verbose=verbose,
             smooth=experimental_smooth,
+            splat_points=splat_points,
+            splat_scales=splat_scales,
+            splat_rotations=splat_rotations,
+            splat_opacity=splat_opacity,
         )
         vertices, faces = result.vertices, result.faces
         if experimental_quad_path:

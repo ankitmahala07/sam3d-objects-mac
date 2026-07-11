@@ -8,6 +8,7 @@ from typing import Optional
 
 import numpy as np
 import open3d as o3d
+from scipy.spatial import cKDTree
 import trimesh
 
 
@@ -234,6 +235,82 @@ def _query_closest(scene, points: np.ndarray, chunk_size: int = 200_000):
         np.concatenate(closest).astype(np.float32, copy=False),
         np.concatenate(normals).astype(np.float32, copy=False),
     )
+
+
+def _gaussian_minor_axes(scales: np.ndarray, rotations: np.ndarray):
+    rotations = np.asarray(rotations, dtype=np.float32)
+    lengths = np.linalg.norm(rotations, axis=1)
+    rotations = rotations / np.maximum(lengths[:, None], 1e-12)
+    w, x, y, z = rotations.T
+    columns = np.stack(
+        [
+            np.stack([1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y)], axis=1),
+            np.stack([2 * (x * y - w * z), 1 - 2 * (x * x + z * z), 2 * (y * z + w * x)], axis=1),
+            np.stack([2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x * x + y * y)], axis=1),
+        ],
+        axis=1,
+    )
+    minor = np.argmin(scales, axis=1)
+    return columns[np.arange(columns.shape[0]), minor], scales[np.arange(scales.shape[0]), minor]
+
+
+class _SplatSurface:
+    def __init__(self, points, normals, thickness, opacity):
+        self.points = np.asarray(points, dtype=np.float32)
+        self.normals = np.asarray(normals, dtype=np.float32)
+        self.thickness = np.asarray(thickness, dtype=np.float32)
+        self.opacity = np.asarray(opacity, dtype=np.float32)
+        self.tree = cKDTree(self.points)
+        self.neighbors = max(8, _env_int("SAM3D_EXPERIMENTAL_SPLAT_NEIGHBORS", 24))
+
+    def project(self, points):
+        queries = np.asarray(points, dtype=np.float32)
+        k = min(self.neighbors, self.points.shape[0])
+        distances, indices = self.tree.query(queries, k=k, workers=-1)
+        if k == 1:
+            distances = distances[:, None]
+            indices = indices[:, None]
+        samples = self.points[indices]
+        normals = self.normals[indices]
+        anchor = normals[:, :1]
+        signs = np.where(np.sum(normals * anchor, axis=2, keepdims=True) < 0.0, -1.0, 1.0)
+        aligned = normals * signs
+        agreement = np.abs(np.sum(normals * anchor, axis=2))
+
+        bandwidth_index = min(k - 1, max(3, k // 2))
+        bandwidth = np.maximum(distances[:, bandwidth_index], 1e-6)
+        spatial = np.exp(-0.5 * np.square(distances / bandwidth[:, None]))
+        offsets = np.sum((queries[:, None, :] - samples) * aligned, axis=2)
+        plane_sigma = np.maximum(
+            self.thickness[indices] * 2.5,
+            bandwidth[:, None] * 0.18,
+        )
+        plane_weight = np.exp(-0.5 * np.square(offsets / np.maximum(plane_sigma, 1e-7)))
+        weights = (
+            spatial
+            * plane_weight
+            * self.opacity[indices]
+            * np.square(np.clip(agreement, 0.0, 1.0))
+        )
+        weights *= agreement >= _env_float("SAM3D_EXPERIMENTAL_SPLAT_NORMAL_AGREEMENT", 0.55)
+        weight_sum = weights.sum(axis=1)
+        weak = weight_sum < 1e-8
+        if weak.any():
+            weights[weak, 0] = 1.0
+            weight_sum[weak] = 1.0
+
+        plane_projections = queries[:, None, :] - aligned * offsets[:, :, None]
+        projected = np.sum(plane_projections * weights[:, :, None], axis=1) / weight_sum[:, None]
+        output_normals = np.sum(aligned * weights[:, :, None], axis=1)
+        normal_lengths = np.linalg.norm(output_normals, axis=1)
+        output_normals /= np.maximum(normal_lengths[:, None], 1e-12)
+        return projected.astype(np.float32), output_normals.astype(np.float32)
+
+
+def _query_fit_surface(surface, points):
+    if isinstance(surface, _SplatSurface):
+        return surface.project(points)
+    return _query_closest(surface, points)
 
 
 def _grid_spec(
@@ -1149,6 +1226,72 @@ def _vertex_normals(vertices: np.ndarray, triangles: np.ndarray):
     return normals
 
 
+def _smooth_source_proxy(vertices: np.ndarray, faces: np.ndarray):
+    """Remove decoder-scale faceting while retaining boundaries and hard creases."""
+    iterations = max(0, _env_int("SAM3D_EXPERIMENTAL_PROXY_SMOOTH_ITERS", 4))
+    baseline = np.asarray(vertices, dtype=np.float32)
+    if iterations == 0 or faces.shape[0] == 0:
+        return baseline.copy(), {"source_proxy_smoothing": False}
+
+    all_edges = np.sort(
+        np.concatenate(
+            [faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]], axis=0
+        ),
+        axis=1,
+    )
+    edges, counts = np.unique(all_edges, axis=0, return_counts=True)
+    degree = np.zeros(baseline.shape[0], dtype=np.float32)
+    np.add.at(degree, edges[:, 0], 1.0)
+    np.add.at(degree, edges[:, 1], 1.0)
+    degree = np.maximum(degree, 1.0)
+
+    locked = np.zeros(baseline.shape[0], dtype=bool)
+    boundary = edges[counts != 2]
+    if boundary.shape[0]:
+        locked[np.unique(boundary)] = True
+    mesh = trimesh.Trimesh(vertices=baseline, faces=faces, process=False)
+    angles = np.degrees(np.asarray(mesh.face_adjacency_angles))
+    adjacency_edges = np.asarray(mesh.face_adjacency_edges, dtype=np.int64)
+    sharp_limit = _env_float("SAM3D_EXPERIMENTAL_PROXY_FEATURE_ANGLE", 48.0)
+    sharp = np.isfinite(angles) & (angles >= sharp_limit)
+    if adjacency_edges.shape[0] == sharp.shape[0] and sharp.any():
+        locked[np.unique(adjacency_edges[sharp])] = True
+
+    mobility = (~locked).astype(np.float32)[:, None]
+    edge_lengths = np.linalg.norm(
+        baseline[edges[:, 1]] - baseline[edges[:, 0]], axis=1
+    )
+    typical_edge = float(np.median(edge_lengths[edge_lengths > 1e-10]))
+    total_limit = typical_edge * _env_float(
+        "SAM3D_EXPERIMENTAL_PROXY_DISPLACEMENT", 0.85
+    )
+    lambda_step = float(
+        np.clip(_env_float("SAM3D_EXPERIMENTAL_PROXY_WEIGHT", 0.24), 0.0, 0.4)
+    )
+    mu_step = _env_float("SAM3D_EXPERIMENTAL_PROXY_INFLATE", -0.25)
+    output = baseline.copy()
+    for _ in range(iterations):
+        for step_weight in (lambda_step, mu_step):
+            neighbor_sum = np.zeros_like(output)
+            np.add.at(neighbor_sum, edges[:, 0], output[edges[:, 1]])
+            np.add.at(neighbor_sum, edges[:, 1], output[edges[:, 0]])
+            laplacian = neighbor_sum / degree[:, None] - output
+            output += laplacian * step_weight * mobility
+        displacement = output - baseline
+        lengths = np.linalg.norm(displacement, axis=1)
+        scale = np.minimum(1.0, total_limit / np.maximum(lengths, 1e-12))
+        output = baseline + displacement * scale[:, None]
+        output[locked] = baseline[locked]
+
+    displacement = np.linalg.norm(output - baseline, axis=1)
+    return output.astype(np.float32), {
+        "source_proxy_smoothing": True,
+        "source_proxy_locked_vertices": int(locked.sum()),
+        "source_proxy_displacement_p95": float(np.percentile(displacement, 95)),
+        "source_proxy_displacement_max": float(displacement.max(initial=0.0)),
+    }
+
+
 def _relax_and_project(vertices, quads, feature_strength, source_scene, spacing):
     iterations = max(0, _env_int("SAM3D_EXPERIMENTAL_RELAX_ITERS", 2))
     if iterations == 0:
@@ -1477,78 +1620,89 @@ def _fair_low_curvature_surface(
 ):
     iterations = max(0, _env_int("SAM3D_EXPERIMENTAL_FAIR_ITERS", 3))
     if iterations == 0:
-        return vertices
-    triangles = _triangulate_quads(vertices, quads)
-    if extra_triangles.shape[0]:
-        triangles = np.concatenate([triangles, extra_triangles], axis=0)
+        return vertices, {"fair_accepted": False, "fair_reason": "disabled"}
 
-    adjacency = [set() for _ in range(vertices.shape[0])]
+    edge_set = set()
     for quad in quads:
         for a, b in zip(quad, np.roll(quad, -1)):
-            adjacency[int(a)].add(int(b))
-            adjacency[int(b)].add(int(a))
+            edge_set.add((min(int(a), int(b)), max(int(a), int(b))))
     for triangle in extra_triangles:
         for a, b in zip(triangle, np.roll(triangle, -1)):
-            adjacency[int(a)].add(int(b))
-            adjacency[int(b)].add(int(a))
+            edge_set.add((min(int(a), int(b)), max(int(a), int(b))))
+    if not edge_set:
+        return vertices, {"fair_accepted": False, "fair_reason": "no usable edges"}
+    edges = np.asarray(sorted(edge_set), dtype=np.int64)
+    degree = np.zeros(vertices.shape[0], dtype=np.float32)
+    np.add.at(degree, edges[:, 0], 1.0)
+    np.add.at(degree, edges[:, 1], 1.0)
+    degree = np.maximum(degree, 1.0)
 
-    points = vertices[triangles]
-    face_normals = np.cross(points[:, 1] - points[:, 0], points[:, 2] - points[:, 0])
-    face_lengths = np.linalg.norm(face_normals, axis=1)
-    valid = face_lengths > 1e-12
-    face_normals[valid] /= face_lengths[valid, None]
-    vertex_normals = _vertex_normals(vertices, triangles)
-    curvature = np.zeros(vertices.shape[0], dtype=np.float32)
-    for corner in range(3):
-        agreement = np.einsum(
-            "ij,ij->i", face_normals, vertex_normals[triangles[:, corner]]
-        ).clip(-1.0, 1.0)
-        angle = np.degrees(np.arccos(agreement))
-        np.maximum.at(curvature, triangles[:, corner], angle)
-    lock_start = _env_float("SAM3D_EXPERIMENTAL_FAIR_LOCK_START", 10.0)
-    lock_end = max(
-        lock_start + 1.0,
-        _env_float("SAM3D_EXPERIMENTAL_FAIR_LOCK_END", 30.0),
+    triangles = _runtime_triangles(vertices, quads, extra_triangles)
+    curvature_lock = _surface_curvature_lock(
+        vertices,
+        triangles,
+        start_env="SAM3D_EXPERIMENTAL_FAIR_LOCK_START",
+        end_env="SAM3D_EXPERIMENTAL_FAIR_LOCK_END",
+        default_start=88.0,
+        default_end=89.0,
+        maximum=0.0,
     )
-    curvature_lock = np.clip((curvature - lock_start) / (lock_end - lock_start), 0.0, 1.0)
     if feature_strength.shape[0] == vertices.shape[0]:
-        qef_lock = np.clip(feature_strength * 1.5, 0.0, 1.0)
+        qef_lock = _qef_feature_lock(feature_strength)
         lock = np.maximum(curvature_lock, qef_lock)
     else:
         lock = curvature_lock
+    mobility = (1.0 - lock)[:, None]
 
-    weight = float(np.clip(_env_float("SAM3D_EXPERIMENTAL_FAIR_WEIGHT", 0.18), 0.0, 0.5))
-    projection_limit = float(np.linalg.norm(spacing)) * _env_float(
-        "SAM3D_EXPERIMENTAL_FAIR_PROJECTION_LIMIT", 0.35
+    baseline = vertices.astype(np.float32).copy()
+    base_metrics = _surface_candidate_metrics(
+        baseline, quads, extra_triangles, source_scene, spacing, feature_strength
     )
-    output = vertices.copy()
+    lambda_step = float(
+        np.clip(_env_float("SAM3D_EXPERIMENTAL_FAIR_WEIGHT", 0.12), 0.0, 0.35)
+    )
+    mu_step = _env_float("SAM3D_EXPERIMENTAL_FAIR_INFLATE", -0.125)
+    projection_limit = float(np.linalg.norm(spacing)) * _env_float(
+        "SAM3D_EXPERIMENTAL_FAIR_PROJECTION_LIMIT", 0.50
+    )
+    projection_blend = float(
+        np.clip(_env_float("SAM3D_EXPERIMENTAL_FAIR_PROJECT", 0.65), 0.0, 1.0)
+    )
+    output = baseline.copy()
     for _ in range(iterations):
-        runtime_triangles = _triangulate_quads(output, quads)
-        if extra_triangles.shape[0]:
-            runtime_triangles = np.concatenate([runtime_triangles, extra_triangles], axis=0)
-        normals = _vertex_normals(output, runtime_triangles)
-        candidate = output.copy()
-        for index, neighbors in enumerate(adjacency):
-            if not neighbors:
-                continue
-            neighbor_ids = np.fromiter(neighbors, dtype=np.int64)
-            laplacian = output[neighbor_ids].mean(axis=0) - output[index]
-            tangent = laplacian - normals[index] * np.dot(laplacian, normals[index])
-            candidate[index] += tangent * weight * (1.0 - lock[index])
-
-        closest, _ = _query_closest(source_scene, candidate)
-        correction = closest - candidate
+        for step_weight in (lambda_step, mu_step):
+            neighbor_sum = np.zeros_like(output)
+            np.add.at(neighbor_sum, edges[:, 0], output[edges[:, 1]])
+            np.add.at(neighbor_sum, edges[:, 1], output[edges[:, 0]])
+            laplacian = neighbor_sum / degree[:, None] - output
+            output += laplacian * step_weight * mobility
+        closest, _ = _query_fit_surface(source_scene, output)
+        correction = closest - output
         lengths = np.linalg.norm(correction, axis=1)
         scale = np.minimum(1.0, projection_limit / np.maximum(lengths, 1e-12))
-        projection_base = np.clip(
-            _env_float("SAM3D_EXPERIMENTAL_FAIR_PROJECT", 0.10), 0.0, 1.0
-        )
-        projection_feature = np.clip(
-            _env_float("SAM3D_EXPERIMENTAL_FAIR_FEATURE_PROJECT", 0.20), 0.0, 1.0
-        )
-        projection_blend = projection_base + lock * projection_feature
-        output = candidate + correction * scale[:, None] * projection_blend[:, None]
-    return output.astype(np.float32)
+        output += correction * (scale * projection_blend)[:, None]
+
+    metrics = _surface_candidate_metrics(
+        output, quads, extra_triangles, source_scene, spacing, feature_strength
+    )
+    reasons = _surface_candidate_rejections(base_metrics, metrics, conservative=True)
+    smooth_gain = (
+        base_metrics["smooth_dihedral_p75"] - metrics["smooth_dihedral_p75"]
+    ) / max(base_metrics["smooth_dihedral_p75"], 0.25)
+    if smooth_gain < 0.01:
+        reasons.append("no useful smoothness gain")
+    stats = {
+        "fair_accepted": not reasons,
+        "fair_feature_locked_vertices": int((qef_lock >= 0.5).sum())
+        if feature_strength.shape[0] == vertices.shape[0]
+        else 0,
+        "fair_crest_locked_vertices": int((curvature_lock >= 0.5).sum()),
+        "fair_smoothness_gain": float(smooth_gain),
+        "fair_base": base_metrics,
+        "fair_selected": metrics if not reasons else base_metrics,
+        "fair_reason": ", ".join(reasons) if reasons else None,
+    }
+    return (output if not reasons else baseline).astype(np.float32), stats
 
 
 def _runtime_triangles(vertices, quads, extra_triangles):
@@ -1564,6 +1718,7 @@ def _surface_candidate_metrics(
     extra_triangles,
     source_scene,
     spacing,
+    feature_strength=None,
 ):
     triangles = _runtime_triangles(vertices, quads, extra_triangles)
     points = vertices[triangles]
@@ -1594,15 +1749,27 @@ def _surface_candidate_metrics(
     )
     mesh = trimesh.Trimesh(vertices=vertices, faces=triangles, process=False)
     angles = np.degrees(np.asarray(mesh.face_adjacency_angles))
-    angles = angles[np.isfinite(angles)]
+    adjacency_edges = np.asarray(mesh.face_adjacency_edges, dtype=np.int64)
+    finite_angles = np.isfinite(angles)
+    angles = angles[finite_angles]
+    if adjacency_edges.shape[0] == finite_angles.shape[0]:
+        adjacency_edges = adjacency_edges[finite_angles]
     if angles.shape[0] == 0:
         angles = np.zeros(1, dtype=np.float32)
-    smooth_limit = _env_float("SAM3D_EXPERIMENTAL_V2_SMOOTH_ANGLE", 35.0)
-    smooth_angles = angles[angles < smooth_limit]
+        adjacency_edges = np.empty((0, 2), dtype=np.int64)
+    protected = np.zeros(angles.shape[0], dtype=bool)
+    if (
+        feature_strength is not None
+        and len(feature_strength) == vertices.shape[0]
+        and adjacency_edges.shape[0] == angles.shape[0]
+    ):
+        threshold = _env_float("SAM3D_EXPERIMENTAL_FEATURE_EDGE_THRESHOLD", 0.45)
+        protected = np.max(np.asarray(feature_strength)[adjacency_edges], axis=1) >= threshold
+    smooth_angles = angles[~protected]
     if smooth_angles.shape[0] == 0:
         smooth_angles = angles
-    sharp_angles = angles[angles >= smooth_limit]
-    closest, _ = _query_closest(source_scene, vertices)
+    sharp_angles = angles[protected]
+    closest, _ = _query_fit_surface(source_scene, vertices)
     distance = np.linalg.norm(vertices - closest, axis=1) / max(
         float(np.linalg.norm(spacing)), 1e-8
     )
@@ -1621,7 +1788,21 @@ def _surface_candidate_metrics(
     }
 
 
-def _surface_curvature_lock(vertices, triangles):
+def _qef_feature_lock(feature_strength):
+    start = _env_float("SAM3D_EXPERIMENTAL_FEATURE_LOCK_START", 0.40)
+    end = max(start + 1e-3, _env_float("SAM3D_EXPERIMENTAL_FEATURE_LOCK_END", 0.72))
+    return np.clip((np.asarray(feature_strength) - start) / (end - start), 0.0, 0.95)
+
+
+def _surface_curvature_lock(
+    vertices,
+    triangles,
+    start_env="SAM3D_EXPERIMENTAL_V2_LOCK_START",
+    end_env="SAM3D_EXPERIMENTAL_V2_LOCK_END",
+    default_start=80.0,
+    default_end=89.0,
+    maximum=0.35,
+):
     points = vertices[triangles]
     face_normals = np.cross(points[:, 1] - points[:, 0], points[:, 2] - points[:, 0])
     lengths = np.linalg.norm(face_normals, axis=1)
@@ -1634,12 +1815,52 @@ def _surface_curvature_lock(vertices, triangles):
             "ij,ij->i", face_normals, vertex_normals[triangles[:, corner]]
         ).clip(-1.0, 1.0)
         np.maximum.at(curvature, triangles[:, corner], np.degrees(np.arccos(agreement)))
-    lock_start = _env_float("SAM3D_EXPERIMENTAL_V2_LOCK_START", 18.0)
+    lock_start = _env_float(start_env, default_start)
     lock_end = max(
         lock_start + 1.0,
-        _env_float("SAM3D_EXPERIMENTAL_V2_LOCK_END", 45.0),
+        _env_float(end_env, default_end),
     )
-    return np.clip((curvature - lock_start) / (lock_end - lock_start), 0.0, 0.95)
+    return np.clip((curvature - lock_start) / (lock_end - lock_start), 0.0, maximum)
+
+
+def _surface_candidate_rejections(base_metrics, metrics, conservative=False):
+    reasons = []
+    aspect_p95_limit = min(
+        8.0 if conservative else 10.0,
+        max(base_metrics["aspect_p95"] * 1.8, base_metrics["aspect_p95"] + 1.5),
+    )
+    if metrics["aspect_max"] > min(
+        90.0, max(base_metrics["aspect_max"] * 2.0, base_metrics["aspect_max"] + 8.0)
+    ):
+        reasons.append("maximum aspect")
+    if metrics["aspect_p95"] > aspect_p95_limit:
+        reasons.append("p95 aspect")
+    if metrics["source_error_p95_cells"] > max(
+        base_metrics["source_error_p95_cells"] * 1.20,
+        base_metrics["source_error_p95_cells"] + 0.025,
+    ):
+        reasons.append("source error")
+    if metrics["source_error_max_cells"] > max(
+        base_metrics["source_error_max_cells"] * 1.5,
+        base_metrics["source_error_max_cells"] + 0.08,
+    ):
+        reasons.append("maximum source error")
+    error_improved = metrics["source_error_p95_cells"] < (
+        base_metrics["source_error_p95_cells"] * 0.75
+    )
+    if base_metrics["volume"] > 1e-8 and not error_improved:
+        volume_change = abs(metrics["volume"] / base_metrics["volume"] - 1.0)
+        limit = 0.025 if conservative else _env_float(
+            "SAM3D_EXPERIMENTAL_V2_VOLUME_CHANGE", 0.04
+        )
+        if volume_change > limit:
+            reasons.append("volume change")
+    if base_metrics["sharp_edges"] >= 8:
+        if metrics["sharp_edges"] < int(base_metrics["sharp_edges"] * 0.90):
+            reasons.append("source feature loss")
+        if metrics["sharp_dihedral_p95"] < base_metrics["sharp_dihedral_p95"] * 0.70:
+            reasons.append("sharp angle loss")
+    return reasons
 
 
 def _straighten_sharp_chains(
@@ -1676,7 +1897,7 @@ def _straighten_sharp_chains(
     for _ in range(iterations):
         midpoint = output[chain_neighbors].mean(axis=1)
         output[chain_ids] += (midpoint - output[chain_ids]) * weight
-        closest, _ = _query_closest(source_scene, output[chain_ids])
+        closest, _ = _query_fit_surface(source_scene, output[chain_ids])
         correction = closest - output[chain_ids]
         lengths = np.linalg.norm(correction, axis=1)
         scale = np.minimum(1.0, projection_limit / np.maximum(lengths, 1e-12))
@@ -1691,12 +1912,13 @@ def _smooth_surface_v2(
     feature_strength,
     source_scene,
     spacing,
+    profile_limit_override=None,
 ):
     """Select the safest useful smoothing profile for the accepted base mesh."""
     baseline = vertices.astype(np.float32).copy()
     triangles = _runtime_triangles(baseline, quads, extra_triangles)
     base_metrics = _surface_candidate_metrics(
-        baseline, quads, extra_triangles, source_scene, spacing
+        baseline, quads, extra_triangles, source_scene, spacing, feature_strength
     )
     stats = {
         "v2_requested": True,
@@ -1726,7 +1948,7 @@ def _smooth_surface_v2(
 
     curvature_lock = _surface_curvature_lock(baseline, triangles)
     if feature_strength.shape[0] == vertices.shape[0]:
-        feature_lock = np.clip(feature_strength, 0.0, 0.95)
+        feature_lock = _qef_feature_lock(feature_strength)
     else:
         feature_lock = np.zeros(vertices.shape[0], dtype=np.float32)
     lock = np.maximum(curvature_lock, feature_lock)
@@ -1735,11 +1957,15 @@ def _smooth_surface_v2(
         "SAM3D_EXPERIMENTAL_V2_PROJECTION_LIMIT", 0.40
     )
     profiles = (
-        ("gentle", 3, 0.18, -0.19, 0.55, 0),
-        ("balanced", 5, 0.24, -0.25, 0.50, 2),
-        ("strong", 7, 0.30, -0.31, 0.45, 3),
+        ("gentle", 3, 0.14, -0.145, 0.65, 0),
+        ("balanced", 5, 0.20, -0.21, 0.70, 2),
+        ("strong", 7, 0.25, -0.26, 0.75, 3),
     )
-    profile_limit = max(1, min(3, _env_int("SAM3D_EXPERIMENTAL_V2_PROFILES", 3)))
+    profile_limit = (
+        max(1, min(3, int(profile_limit_override)))
+        if profile_limit_override is not None
+        else max(1, min(3, _env_int("SAM3D_EXPERIMENTAL_V2_PROFILES", 3)))
+    )
     best_vertices = baseline
     best_metrics = base_metrics
     best_score = 0.0
@@ -1754,7 +1980,7 @@ def _smooth_surface_v2(
                 np.add.at(neighbor_sum, edges[:, 1], output[edges[:, 0]])
                 laplacian = neighbor_sum / degree[:, None] - output
                 output += laplacian * step_weight * mobility
-            closest, _ = _query_closest(source_scene, output)
+            closest, _ = _query_fit_surface(source_scene, output)
             correction = closest - output
             lengths = np.linalg.norm(correction, axis=1)
             scale = np.minimum(1.0, projection_limit / np.maximum(lengths, 1e-12))
@@ -1779,36 +2005,9 @@ def _smooth_surface_v2(
             stats["v2_rejections"].append(f"{name}: non-finite vertices")
             continue
         metrics = _surface_candidate_metrics(
-            candidate, quads, extra_triangles, source_scene, spacing
+            candidate, quads, extra_triangles, source_scene, spacing, feature_strength
         )
-        reasons = []
-        if metrics["aspect_max"] > min(
-            80.0, max(base_metrics["aspect_max"] * 1.5, base_metrics["aspect_max"] + 1.0)
-        ):
-            reasons.append("maximum aspect")
-        if metrics["aspect_p95"] > max(
-            base_metrics["aspect_p95"] * 1.25, base_metrics["aspect_p95"] + 0.4
-        ):
-            reasons.append("p95 aspect")
-        if metrics["source_error_p95_cells"] > max(
-            base_metrics["source_error_p95_cells"] * 1.25,
-            base_metrics["source_error_p95_cells"] + 0.03,
-        ):
-            reasons.append("source error")
-        if metrics["source_error_max_cells"] > max(
-            base_metrics["source_error_max_cells"] * 1.5,
-            base_metrics["source_error_max_cells"] + 0.08,
-        ):
-            reasons.append("maximum source error")
-        if base_metrics["volume"] > 1e-8:
-            volume_change = abs(metrics["volume"] / base_metrics["volume"] - 1.0)
-            if volume_change > _env_float("SAM3D_EXPERIMENTAL_V2_VOLUME_CHANGE", 0.03):
-                reasons.append("volume change")
-        if base_metrics["sharp_edges"] >= 8:
-            if metrics["sharp_edges"] < int(base_metrics["sharp_edges"] * 0.75):
-                reasons.append("sharp edge loss")
-            if metrics["sharp_dihedral_p95"] < base_metrics["sharp_dihedral_p95"] * 0.75:
-                reasons.append("sharp angle loss")
+        reasons = _surface_candidate_rejections(base_metrics, metrics)
 
         rough_gain = (
             base_metrics["smooth_dihedral_p75"] - metrics["smooth_dihedral_p75"]
@@ -1923,6 +2122,7 @@ def _build_once(
     local_vertices,
     faces,
     source_scene,
+    fit_scene,
     sign_scene,
     area,
     target_faces,
@@ -2043,30 +2243,50 @@ def _build_once(
         if adaptive_stats["adaptive_refined_quads"]:
             mode = "adaptive-qef-dual-contour"
 
-    vertices = _fair_low_curvature_surface(
+    vertices, fair_stats = _fair_low_curvature_surface(
         vertices,
         quads,
         repair_faces,
         feature_strength,
-        source_scene,
+        fit_scene,
         sampled_spacing,
     )
     v2_stats = {
+        **fair_stats,
         "v2_requested": bool(smooth),
         "v2_accepted": False,
         "v2_profile": "baseline",
         "v2_score": 0.0,
         "v2_rejections": [],
     }
+    vertices, base_refine_stats = _smooth_surface_v2(
+        vertices,
+        quads,
+        repair_faces,
+        feature_strength,
+        fit_scene,
+        sampled_spacing,
+        profile_limit_override=2,
+    )
+    v2_stats.update(
+        {
+            "base_refine_accepted": base_refine_stats["v2_accepted"],
+            "base_refine_profile": base_refine_stats["v2_profile"],
+            "base_refine_score": base_refine_stats["v2_score"],
+            "base_refine_rejections": base_refine_stats["v2_rejections"],
+            "base_refine_selected": base_refine_stats["v2_selected"],
+        }
+    )
     if smooth:
-        vertices, v2_stats = _smooth_surface_v2(
+        vertices, selected_v2_stats = _smooth_surface_v2(
             vertices,
             quads,
             repair_faces,
             feature_strength,
-            source_scene,
+            fit_scene,
             sampled_spacing,
         )
+        v2_stats.update(selected_v2_stats)
     quads, repair_faces = _orient_connected_polygons(
         vertices,
         quads,
@@ -2094,6 +2314,10 @@ def retopologize(
     target_faces: Optional[int] = None,
     verbose: bool = False,
     smooth: bool = False,
+    splat_points: Optional[np.ndarray] = None,
+    splat_scales: Optional[np.ndarray] = None,
+    splat_rotations: Optional[np.ndarray] = None,
+    splat_opacity: Optional[np.ndarray] = None,
 ) -> ExperimentalRetopoResult:
     source = _clean_source(vertices, faces)
     source, removed_source_components = _largest_source_component(source)
@@ -2108,6 +2332,46 @@ def retopologize(
     area = float(max(local_source.area, 1e-8))
     scale = float(max(np.linalg.norm(np.ptp(local_vertices, axis=0)), 1e-8))
     source_scene = _make_scene(local_vertices, source_faces)
+    fit_vertices, proxy_stats = _smooth_source_proxy(local_vertices, source_faces)
+    fit_scene = _make_scene(fit_vertices, source_faces)
+    if all(value is not None for value in (splat_points, splat_scales, splat_rotations, splat_opacity)):
+        splat_points = np.asarray(splat_points, dtype=np.float32)
+        splat_scales = np.asarray(splat_scales, dtype=np.float32)
+        splat_rotations = np.asarray(splat_rotations, dtype=np.float32)
+        splat_opacity = np.asarray(splat_opacity, dtype=np.float32).reshape(-1)
+        splat_normals, splat_thickness = _gaussian_minor_axes(splat_scales, splat_rotations)
+        local_splat_points = (splat_points - center) @ axes
+        local_splat_normals = splat_normals @ axes
+        bounds_min = local_vertices.min(axis=0)
+        bounds_max = local_vertices.max(axis=0)
+        margin = np.maximum((bounds_max - bounds_min) * 0.08, 1e-4)
+        valid_splats = (
+            np.isfinite(local_splat_points).all(axis=1)
+            & np.isfinite(local_splat_normals).all(axis=1)
+            & np.isfinite(splat_thickness)
+            & np.isfinite(splat_opacity)
+            & (splat_opacity >= _env_float("SAM3D_EXPERIMENTAL_SPLAT_OPACITY", 0.05))
+            & (local_splat_points >= bounds_min - margin).all(axis=1)
+            & (local_splat_points <= bounds_max + margin).all(axis=1)
+        )
+        if int(valid_splats.sum()) >= 100:
+            fit_scene = _SplatSurface(
+                local_splat_points[valid_splats],
+                local_splat_normals[valid_splats],
+                splat_thickness[valid_splats],
+                splat_opacity[valid_splats],
+            )
+            proxy_stats.update(
+                {
+                    "fit_surface": "gaussian-mls",
+                    "fit_splats": int(valid_splats.sum()),
+                    "input_splats": int(splat_points.shape[0]),
+                }
+            )
+        else:
+            proxy_stats["fit_surface"] = "smoothed-decoder-fallback"
+    else:
+        proxy_stats["fit_surface"] = "smoothed-decoder-fallback"
     sign_vertices_world = np.asarray(sign_source.vertices, dtype=np.float32)
     sign_vertices_local = (sign_vertices_world - center) @ axes
     sign_faces = np.asarray(sign_source.faces, dtype=np.int64)
@@ -2150,6 +2414,7 @@ def retopologize(
             local_vertices,
             source_faces,
             source_scene,
+            fit_scene,
             sign_scene,
             area,
             effective_target,
@@ -2251,6 +2516,7 @@ def retopologize(
         "source_faces": int(source_faces.shape[0]),
         "removed_source_components": int(removed_source_components),
         "closed_source_loops": int(closed_source_loops),
+        **proxy_stats,
         "requested_faces": int(requested_target),
         "effective_target_faces": int(metrics["target_faces"]),
         "attempts": attempt_stats,
