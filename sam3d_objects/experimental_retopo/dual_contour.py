@@ -2293,6 +2293,20 @@ def _build_once(
         repair_faces,
         source_scene,
     )
+    oriented_triangles = _runtime_triangles(vertices, quads, repair_faces)
+    signed_volume = float(
+        trimesh.Trimesh(
+            vertices=vertices,
+            faces=oriented_triangles,
+            process=False,
+        ).volume
+    )
+    orientation_flipped = signed_volume < 0.0
+    if orientation_flipped:
+        quads = quads[:, ::-1].copy()
+        repair_faces = repair_faces[:, ::-1].copy()
+    v2_stats["orientation_flipped_outward"] = orientation_flipped
+    v2_stats["oriented_volume"] = abs(signed_volume)
     return (
         vertices,
         quads,

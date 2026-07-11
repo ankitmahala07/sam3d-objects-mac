@@ -21,6 +21,8 @@ def _assert_manifold_result(result):
     assert result.stats["winding_consistent"]
     assert result.stats["surface_error_p95"] < 0.01
     assert result.stats["aspect_max"] < 100.0
+    runtime = trimesh.Trimesh(result.vertices, result.faces, process=False)
+    assert runtime.volume > 0.0
 
 
 def test_hard_surface_grid_preserves_planes(tmp_path):
