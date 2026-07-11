@@ -33,6 +33,31 @@ def smooth_vertex_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray
     return normals
 
 
+def seamless_vertex_normals(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    weld_digits: int = 7,
+) -> np.ndarray:
+    """Calculate one smooth normal per position and map it across UV duplicates."""
+    vertices = np.asarray(vertices, dtype=np.float32)
+    faces = np.asarray(faces, dtype=np.int64)
+    _, inverse = np.unique(
+        np.round(vertices, decimals=weld_digits),
+        axis=0,
+        return_inverse=True,
+    )
+    points = vertices[faces]
+    face_normals = np.cross(points[:, 1] - points[:, 0], points[:, 2] - points[:, 0])
+    welded = np.zeros((int(inverse.max(initial=-1)) + 1, 3), dtype=np.float32)
+    for corner in range(3):
+        np.add.at(welded, inverse[faces[:, corner]], face_normals)
+    lengths = np.linalg.norm(welded, axis=1)
+    valid = lengths > 1e-12
+    welded[valid] /= lengths[valid, None]
+    welded[~valid, 2] = 1.0
+    return welded[inverse]
+
+
 def _clean_reference(vertices: np.ndarray, faces: np.ndarray) -> trimesh.Trimesh:
     vertices = np.asarray(vertices, dtype=np.float64)
     faces = np.asarray(faces, dtype=np.int64)

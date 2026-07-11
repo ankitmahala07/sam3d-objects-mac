@@ -7,6 +7,7 @@ from sam3d_objects.experimental_retopo import (
     bake_gaussian_color_texture,
     bake_tangent_normal_map,
     retopologize,
+    seamless_vertex_normals,
     write_quad_obj,
 )
 
@@ -226,3 +227,19 @@ def test_gaussian_color_bake_runs_after_final_surface():
     assert texture[..., 0].std() > 40
     assert texture[..., 1].std() > 40
     assert 45 < float(texture[..., 2].mean()) < 80
+
+
+def test_uv_duplicates_receive_identical_normals():
+    vertices = np.asarray(
+        [
+            [-1, -1, 0], [1, -1, 0], [1, 1, 0],
+            [-1, -1, 0], [1, 1, 0], [-1, 1, 0],
+        ],
+        dtype=np.float32,
+    )
+    faces = np.asarray([[0, 1, 2], [3, 4, 5]], dtype=np.int64)
+    normals = seamless_vertex_normals(vertices, faces)
+
+    assert np.allclose(normals[0], normals[3])
+    assert np.allclose(normals[2], normals[4])
+    assert np.allclose(normals, np.asarray([0, 0, 1], dtype=np.float32))

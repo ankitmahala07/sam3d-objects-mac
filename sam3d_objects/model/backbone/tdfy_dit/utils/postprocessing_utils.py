@@ -1609,13 +1609,10 @@ def to_glb(
     if with_texture_baking:
         # parametrize mesh
         if experimental_retopo:
-            from sam3d_objects.experimental_retopo import smooth_vertex_normals
+            from sam3d_objects.experimental_retopo import seamless_vertex_normals
 
-            pre_uv_normals = smooth_vertex_normals(vertices, faces)
-            vertices, faces, uvs, vmapping = parametrize_mesh(
-                vertices, faces, return_mapping=True
-            )
-            experimental_vertex_normals = pre_uv_normals[vmapping]
+            vertices, faces, uvs = parametrize_mesh(vertices, faces)
+            experimental_vertex_normals = seamless_vertex_normals(vertices, faces)
         else:
             vertices, faces, uvs = parametrize_mesh(vertices, faces)
         logger.info("Baking texture ...")
