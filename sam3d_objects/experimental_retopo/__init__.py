@@ -4,16 +4,16 @@ from .dual_contour import (
     write_quad_obj,
 )
 from .normal_bake import (
+    bake_gaussian_color_texture,
     bake_tangent_normal_map,
     smooth_vertex_normals,
-    split_vertices_by_crease,
 )
 
 __all__ = [
     "ExperimentalRetopoResult",
+    "bake_gaussian_color_texture",
     "bake_tangent_normal_map",
     "retopologize",
     "smooth_vertex_normals",
-    "split_vertices_by_crease",
     "write_quad_obj",
 ]

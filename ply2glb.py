@@ -245,7 +245,7 @@ def main():
     elif experimental_mode:
         ok(f"Experimental generation: target={target_faces or 'auto'}")
         ok(
-            "Experimental method: adaptive QEF surface + tangent normal detail"
+            "Experimental method: Gaussian MLS surface + post-retopo color projection"
             + (" + v2 surface smoothing" if args.experimental_v2 else "")
         )
     progress = make_progress(

@@ -144,11 +144,11 @@ Output in `outputs/<name>/`:
 | `mesh.glb`      | optional unoptimised high-detail textured mesh         |
 | `mesh_experimental.glb` | optional experimental textured runtime mesh    |
 | `mesh_experimental_quads.obj` | editable quad-dominant experimental mesh |
-| `mesh_experimental_normal.png` | baked high-detail tangent normal map     |
+| `mesh_experimental_normal.png` | optional tangent normal-map sidecar      |
 | `mesh_experimental_report.json` | topology and surface-error measurements |
 | `mesh_experimental_v2.glb` | quality-gated smoother experimental mesh   |
 | `mesh_experimental_v2_quads.obj` | editable V2 quad-dominant mesh        |
-| `mesh_experimental_v2_normal.png` | V2 tangent normal map                  |
+| `mesh_experimental_v2_normal.png` | optional V2 normal-map sidecar         |
 | `mesh_experimental_v2_report.json` | V2 selection and quality measurements |
 
 Multiple views are experimental and memory-sensitive. View 1 drives depth and
@@ -247,6 +247,7 @@ more faces when necessary. Its main limits can be adjusted without changing code
 | `SAM3D_EXPERIMENTAL_ADAPTIVE_ANGLE` | `16` | local source-normal threshold in degrees |
 | `SAM3D_EXPERIMENTAL_ADAPTIVE_MAX_TRANSITION_RATIO` | `0.15` | maximum runtime triangle share used by adaptive transitions |
 | `SAM3D_EXPERIMENTAL_NORMAL_SIZE` | texture size | experimental tangent normal-map resolution |
+| `SAM3D_EXPERIMENTAL_ATTACH_NORMAL_MAP` | `0` | attach the optional tangent normal map to experimental GLBs |
 | `SAM3D_EXPERIMENTAL_NORMAL_STRENGTH` | `0.35` | high-poly geometric normal contribution |
 | `SAM3D_EXPERIMENTAL_ALBEDO_RELIEF` | `0.08` | subtle high-frequency crack/detail contribution |
 | `SAM3D_EXPERIMENTAL_V2_PROFILES` | `3` | number of V2 smoothing candidates to evaluate |

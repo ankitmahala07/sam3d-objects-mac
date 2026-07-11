@@ -1507,6 +1507,11 @@ def to_glb(
         splat_scales = app_rep.get_scaling.detach().float().cpu().numpy()
         splat_rotations = app_rep.get_rotation.detach().float().cpu().numpy()
         splat_opacity = app_rep.get_opacity.detach().float().cpu().numpy()
+        splat_colors = (
+            app_rep.get_features[:, 0, :].detach().float().cpu().numpy()
+            * 0.28209479177387814
+            + 0.5
+        )
         result = retopologize(
             vertices,
             faces,
@@ -1604,9 +1609,9 @@ def to_glb(
     if with_texture_baking:
         # parametrize mesh
         if experimental_retopo:
-            from sam3d_objects.experimental_retopo import split_vertices_by_crease
+            from sam3d_objects.experimental_retopo import smooth_vertex_normals
 
-            vertices, faces, pre_uv_normals = split_vertices_by_crease(vertices, faces)
+            pre_uv_normals = smooth_vertex_normals(vertices, faces)
             vertices, faces, uvs, vmapping = parametrize_mesh(
                 vertices, faces, return_mapping=True
             )
@@ -1616,7 +1621,23 @@ def to_glb(
         logger.info("Baking texture ...")
         _emit_progress(progress_callback, "UV unwrap", 1)
 
-        if texture_mode == "average" and isinstance(app_rep, Gaussian):
+        if experimental_retopo and isinstance(app_rep, Gaussian):
+            from sam3d_objects.experimental_retopo import bake_gaussian_color_texture
+
+            texture = bake_gaussian_color_texture(
+                vertices,
+                faces,
+                uvs,
+                experimental_vertex_normals,
+                splat_points,
+                splat_colors,
+                splat_opacity,
+                splat_scales,
+                splat_rotations,
+                texture_size=texture_size,
+            )
+            _emit_progress(progress_callback, "Gaussian surface color bake", 3)
+        elif texture_mode == "average" and isinstance(app_rep, Gaussian):
             texture = bake_texture_average_streaming(
                 app_rep,
                 vertices,

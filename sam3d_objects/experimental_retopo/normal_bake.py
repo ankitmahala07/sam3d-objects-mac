@@ -6,6 +6,7 @@ from typing import Optional
 import cv2
 import numpy as np
 import open3d as o3d
+from scipy.spatial import cKDTree
 import trimesh
 from PIL import Image
 
@@ -30,54 +31,6 @@ def smooth_vertex_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray
     normals[valid] /= lengths[valid, None]
     normals[~valid, 2] = 1.0
     return normals
-
-
-def split_vertices_by_crease(
-    vertices: np.ndarray,
-    faces: np.ndarray,
-    crease_angle: Optional[float] = None,
-):
-    """Create render-only smoothing groups without changing the geometric surface."""
-    vertices = np.asarray(vertices, dtype=np.float32)
-    faces = np.asarray(faces, dtype=np.int64)
-    if faces.shape[0] == 0:
-        return vertices.copy(), faces.copy(), np.zeros_like(vertices)
-    if crease_angle is None:
-        crease_angle = _env_float("SAM3D_EXPERIMENTAL_NORMAL_CREASE", 50.0)
-
-    corner_vertices = faces.reshape(-1)
-    parent = np.arange(corner_vertices.shape[0], dtype=np.int64)
-
-    def find(index):
-        while parent[index] != index:
-            parent[index] = parent[parent[index]]
-            index = parent[index]
-        return index
-
-    def union(a, b):
-        root_a = find(a)
-        root_b = find(b)
-        if root_a != root_b:
-            parent[root_b] = root_a
-
-    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-    adjacency = np.asarray(mesh.face_adjacency, dtype=np.int64)
-    edges = np.asarray(mesh.face_adjacency_edges, dtype=np.int64)
-    angles = np.degrees(np.asarray(mesh.face_adjacency_angles))
-    for (face_a, face_b), edge, angle in zip(adjacency, edges, angles):
-        if not np.isfinite(angle) or angle > crease_angle:
-            continue
-        for vertex in edge:
-            corner_a = int(face_a) * 3 + int(np.flatnonzero(faces[face_a] == vertex)[0])
-            corner_b = int(face_b) * 3 + int(np.flatnonzero(faces[face_b] == vertex)[0])
-            union(corner_a, corner_b)
-
-    roots = np.asarray([find(index) for index in range(parent.shape[0])], dtype=np.int64)
-    _, inverse = np.unique(roots, return_inverse=True)
-    split_vertices = vertices[corner_vertices[np.unique(roots, return_index=True)[1]]]
-    split_faces = inverse.reshape(-1, 3).astype(np.int64)
-    split_normals = smooth_vertex_normals(split_vertices, split_faces)
-    return split_vertices.astype(np.float32), split_faces, split_normals
 
 
 def _clean_reference(vertices: np.ndarray, faces: np.ndarray) -> trimesh.Trimesh:
@@ -122,6 +75,22 @@ def _normalize(vectors: np.ndarray) -> np.ndarray:
     output[valid] /= lengths[valid, None]
     output[~valid] = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
     return output.astype(np.float32, copy=False)
+
+
+def _gaussian_surface_normals(scales: np.ndarray, rotations: np.ndarray):
+    rotations = np.asarray(rotations, dtype=np.float32)
+    rotations /= np.maximum(np.linalg.norm(rotations, axis=1, keepdims=True), 1e-12)
+    w, x, y, z = rotations.T
+    matrices = np.stack(
+        [
+            1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+            2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+            2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y),
+        ],
+        axis=1,
+    ).reshape(-1, 3, 3)
+    minor = np.argmin(np.asarray(scales), axis=1)
+    return matrices[np.arange(matrices.shape[0]), :, minor]
 
 
 def _rasterize_uv_surface(
@@ -177,6 +146,83 @@ def _rasterize_uv_surface(
     covered = np.flatnonzero(face_ids >= 0)
     normals[covered] = _normalize(normals[covered])
     return positions, normals, face_ids, covered
+
+
+def bake_gaussian_color_texture(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    uvs: np.ndarray,
+    vertex_normals: np.ndarray,
+    splat_points: np.ndarray,
+    splat_colors: np.ndarray,
+    splat_opacity: np.ndarray,
+    splat_scales: np.ndarray,
+    splat_rotations: np.ndarray,
+    texture_size: int = 1024,
+):
+    """Bake continuous color from local Gaussian neighborhoods after retopology."""
+    size = max(64, int(texture_size))
+    vertices = np.asarray(vertices, dtype=np.float32)
+    faces = np.asarray(faces, dtype=np.int64)
+    uvs = np.asarray(uvs, dtype=np.float32)
+    vertex_normals = _normalize(np.asarray(vertex_normals, dtype=np.float32))
+    positions, low_normals, face_ids, covered = _rasterize_uv_surface(
+        vertices, faces, uvs, vertex_normals, size
+    )
+    if covered.shape[0] == 0:
+        raise RuntimeError("Experimental color bake found no covered UV texels")
+
+    points = np.asarray(splat_points, dtype=np.float32)
+    colors = np.clip(np.asarray(splat_colors, dtype=np.float32), 0.0, 1.0)
+    opacity = np.asarray(splat_opacity, dtype=np.float32).reshape(-1)
+    normals = _gaussian_surface_normals(splat_scales, splat_rotations)
+    center = points.mean(axis=0)
+    outward = np.einsum("ij,ij->i", normals, points - center) < 0.0
+    normals[outward] *= -1.0
+    valid = (
+        np.isfinite(points).all(axis=1)
+        & np.isfinite(colors).all(axis=1)
+        & np.isfinite(normals).all(axis=1)
+        & np.isfinite(opacity)
+        & (opacity >= _env_float("SAM3D_EXPERIMENTAL_COLOR_OPACITY", 0.05))
+    )
+    points = points[valid]
+    colors = colors[valid]
+    opacity = opacity[valid]
+    normals = normals[valid]
+    tree = cKDTree(points)
+    neighbors = max(4, int(_env_float("SAM3D_EXPERIMENTAL_COLOR_NEIGHBORS", 16)))
+    neighbors = min(neighbors, points.shape[0])
+    chunk_size = 100_000
+    baked = np.zeros((covered.shape[0], 3), dtype=np.float32)
+    for start in range(0, covered.shape[0], chunk_size):
+        stop = min(covered.shape[0], start + chunk_size)
+        query = positions[covered[start:stop]]
+        query_normals = low_normals[covered[start:stop]]
+        distances, indices = tree.query(query, k=neighbors, workers=-1)
+        if neighbors == 1:
+            distances = distances[:, None]
+            indices = indices[:, None]
+        bandwidth = np.maximum(distances[:, min(neighbors - 1, neighbors // 2)], 1e-6)
+        spatial = np.exp(-0.5 * np.square(distances / bandwidth[:, None]))
+        agreement = np.einsum("ijk,ik->ij", normals[indices], query_normals)
+        side_weight = np.square(np.clip(agreement, 0.0, 1.0))
+        weights = spatial * opacity[indices] * side_weight
+        weight_sum = weights.sum(axis=1)
+        weak = weight_sum < 1e-8
+        if weak.any():
+            weights[weak] = spatial[weak] * opacity[indices[weak]]
+            weight_sum[weak] = weights[weak].sum(axis=1)
+        baked[start:stop] = np.einsum(
+            "ij,ijk->ik", weights, colors[indices]
+        ) / np.maximum(weight_sum[:, None], 1e-8)
+
+    image = np.zeros((size * size, 3), dtype=np.uint8)
+    image[covered] = np.clip(baked * 255.0, 0, 255).astype(np.uint8)
+    image = image.reshape(size, size, 3)
+    missing = (face_ids < 0).reshape(size, size).astype(np.uint8)
+    image = cv2.inpaint(image, missing, 3, cv2.INPAINT_TELEA)
+    return np.ascontiguousarray(image[::-1])
 
 
 def _face_tangent_frames(vertices: np.ndarray, faces: np.ndarray, uvs: np.ndarray):
