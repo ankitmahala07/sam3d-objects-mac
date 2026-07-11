@@ -1863,6 +1863,112 @@ def _surface_candidate_rejections(base_metrics, metrics, conservative=False):
     return reasons
 
 
+def _fit_quad_limit_surface(
+    vertices,
+    quads,
+    extra_triangles,
+    feature_strength,
+    source_scene,
+    spacing,
+):
+    """Fit a Catmull-Clark-style quad limit surface back onto the splat MLS."""
+    stats = {
+        "limit_surface_requested": True,
+        "limit_surface_accepted": False,
+        "limit_surface_reason": None,
+    }
+    iterations = max(0, _env_int("SAM3D_EXPERIMENTAL_LIMIT_ITERS", 3))
+    if iterations == 0 or quads.shape[0] == 0 or extra_triangles.shape[0] != 0:
+        stats["limit_surface_reason"] = "disabled or non-quad topology"
+        return vertices, stats
+
+    baseline = vertices.astype(np.float32).copy()
+    base_metrics = _surface_candidate_metrics(
+        baseline, quads, extra_triangles, source_scene, spacing, feature_strength
+    )
+    incident_faces = [[] for _ in range(vertices.shape[0])]
+    neighbors = [set() for _ in range(vertices.shape[0])]
+    for face_index, quad in enumerate(quads):
+        for corner, vertex in enumerate(quad):
+            vertex = int(vertex)
+            adjacent = int(quad[(corner + 1) % 4])
+            incident_faces[vertex].append(face_index)
+            neighbors[vertex].add(adjacent)
+            neighbors[adjacent].add(vertex)
+
+    if feature_strength.shape[0] == vertices.shape[0]:
+        lock = _qef_feature_lock(feature_strength)
+    else:
+        lock = np.zeros(vertices.shape[0], dtype=np.float32)
+    mobility = 1.0 - lock
+    blend = float(
+        np.clip(_env_float("SAM3D_EXPERIMENTAL_LIMIT_WEIGHT", 0.50), 0.0, 0.75)
+    )
+    projection_limit = float(np.linalg.norm(spacing)) * _env_float(
+        "SAM3D_EXPERIMENTAL_LIMIT_PROJECTION", 0.35
+    )
+    projection_blend = float(
+        np.clip(_env_float("SAM3D_EXPERIMENTAL_LIMIT_PROJECT_BLEND", 0.65), 0.0, 1.0)
+    )
+
+    output = baseline.copy()
+    for _ in range(iterations):
+        face_centers = output[quads].mean(axis=1)
+        candidate = output.copy()
+        for vertex, face_ids in enumerate(incident_faces):
+            neighbor_ids = np.fromiter(neighbors[vertex], dtype=np.int64)
+            valence = len(face_ids)
+            if valence < 3 or neighbor_ids.shape[0] < 3:
+                continue
+            face_average = face_centers[np.asarray(face_ids, dtype=np.int64)].mean(axis=0)
+            edge_average = ((output[vertex] + output[neighbor_ids]) * 0.5).mean(axis=0)
+            limit_position = (
+                face_average
+                + 2.0 * edge_average
+                + (valence - 3.0) * output[vertex]
+            ) / float(valence)
+            candidate[vertex] += (
+                limit_position - output[vertex]
+            ) * blend * mobility[vertex]
+
+        closest, _ = _query_fit_surface(source_scene, candidate)
+        correction = closest - candidate
+        lengths = np.linalg.norm(correction, axis=1)
+        scale = np.minimum(1.0, projection_limit / np.maximum(lengths, 1e-12))
+        output = candidate + correction * (scale * projection_blend)[:, None]
+
+    metrics = _surface_candidate_metrics(
+        output, quads, extra_triangles, source_scene, spacing, feature_strength
+    )
+    reasons = [
+        reason
+        for reason in _surface_candidate_rejections(
+            base_metrics, metrics, conservative=True
+        )
+        if reason != "volume change"
+    ]
+    smoothness_gain = (
+        base_metrics["smooth_dihedral_p75"] - metrics["smooth_dihedral_p75"]
+    ) / max(base_metrics["smooth_dihedral_p75"], 0.25)
+    median_gain = (
+        base_metrics["dihedral_p50"] - metrics["dihedral_p50"]
+    ) / max(base_metrics["dihedral_p50"], 0.25)
+    if smoothness_gain < 0.03 and median_gain < 0.03:
+        reasons.append("no useful smoothness gain")
+    stats.update(
+        {
+            "limit_surface_accepted": not reasons,
+            "limit_surface_smoothness_gain": float(smoothness_gain),
+            "limit_surface_median_gain": float(median_gain),
+            "limit_surface_base": base_metrics,
+            "limit_surface_candidate": metrics,
+            "limit_surface_selected": metrics if not reasons else base_metrics,
+            "limit_surface_reason": ", ".join(reasons) if reasons else None,
+        }
+    )
+    return (output if not reasons else baseline).astype(np.float32), stats
+
+
 def _straighten_sharp_chains(
     vertices,
     triangles,
@@ -2277,6 +2383,15 @@ def _build_once(
             "base_refine_selected": base_refine_stats["v2_selected"],
         }
     )
+    vertices, limit_surface_stats = _fit_quad_limit_surface(
+        vertices,
+        quads,
+        repair_faces,
+        feature_strength,
+        fit_scene,
+        sampled_spacing,
+    )
+    v2_stats.update(limit_surface_stats)
     if smooth:
         vertices, selected_v2_stats = _smooth_surface_v2(
             vertices,
