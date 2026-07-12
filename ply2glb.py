@@ -6,11 +6,9 @@ Usage:
     python ply2glb.py <output_folder>
     python ply2glb.py --game-ready --target-faces 2000 <output_folder>
     python ply2glb.py --experimental --target-faces 2000 <output_folder>
-    python ply2glb.py --experimental-v2 --target-faces 2000 <output_folder>
     ./run.sh glb <output_folder>
     ./run.sh game <output_folder> [target_faces]
     ./run.sh experimental <output_folder> [target_faces]
-    ./run.sh experimentalv2 <output_folder> [target_faces]
 
 Loads only the mesh decoder (~500 MB), not the full inference pipeline.
 Requires slat.pt and splat.ply to exist in <output_folder>.
@@ -116,14 +114,6 @@ def parse_args():
         help="Create an in-repo quad-dominant experimental mesh, writing mesh_experimental.glb.",
     )
     parser.add_argument(
-        "--experimental-v2",
-        action="store_true",
-        help=(
-            "Quality-gated smoothing for the experimental quad mesh, "
-            "writing mesh_experimental_v2.glb."
-        ),
-    )
-    parser.add_argument(
         "--target-faces",
         default="auto",
         help=(
@@ -200,16 +190,14 @@ def main():
     print(f"\n{BOLD}{W}  ply2glb  ·  Gaussian splat → Textured GLB{RST}")
     args = parse_args()
 
-    if args.experimental and args.experimental_v2:
-        err("Choose either --experimental or --experimental-v2, not both.")
-    experimental_mode = args.experimental or args.experimental_v2
+    experimental_mode = args.experimental
     if args.game_ready and experimental_mode:
-        err("Choose either --game-ready or --experimental/--experimental-v2, not both.")
+        err("Choose either --game-ready or --experimental, not both.")
 
     if not args.folder:
         print(
             f"  Usage: {sys.argv[0]} "
-            "[--game-ready|--experimental|--experimental-v2 "
+            "[--game-ready|--experimental "
             "--target-faces auto|N] <output_folder>"
         )
         sys.exit(1)
@@ -217,7 +205,7 @@ def main():
     folder = os.path.abspath(args.folder.strip().strip("'\""))
     ply_path  = os.path.join(folder, "splat.ply")
     slat_path = os.path.join(folder, "slat.pt")
-    experimental_base = "mesh_experimental_v2" if args.experimental_v2 else "mesh_experimental"
+    experimental_base = "mesh_experimental"
     default_name = (
         f"{experimental_base}.glb" if experimental_mode
         else "mesh_game.glb" if args.game_ready
@@ -244,10 +232,7 @@ def main():
         ok("Game-ready method: quality-safe welded mesh export")
     elif experimental_mode:
         ok(f"Experimental generation: target={target_faces or 'auto'}")
-        ok(
-            "Experimental method: Gaussian MLS surface + post-retopo color projection"
-            + (" + v2 surface smoothing" if args.experimental_v2 else "")
-        )
+        ok("Experimental method: decoder-guided quad fit + post-retopo streamed texture")
     progress = make_progress(
         extra_units=2 if experimental_mode else 1 if args.game_ready else 0
     )
@@ -364,7 +349,6 @@ def main():
             game_remesh_method=remesh_method,
             game_retopo_sidecar_path=None,
             experimental_retopo=experimental_mode,
-            experimental_smooth=args.experimental_v2,
             experimental_target_faces=target_faces,
             experimental_quad_path=experimental_quad_path,
             experimental_normal_path=experimental_normal_path,

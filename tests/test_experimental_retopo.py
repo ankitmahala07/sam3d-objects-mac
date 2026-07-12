@@ -92,48 +92,6 @@ def test_adaptive_curved_patch_stays_manifold():
     assert result.stats["adaptive_rejected"] is None
 
 
-def test_v2_keeps_clean_hard_surface_unchanged():
-    source = trimesh.creation.box(extents=[2.0, 1.0, 0.7])
-    source_vertices = np.asarray(source.vertices)
-    source_faces = np.asarray(source.faces)
-    baseline = retopologize(source_vertices, source_faces, target_faces=800)
-    result = retopologize(
-        source_vertices,
-        source_faces,
-        target_faces=800,
-        smooth=True,
-    )
-
-    _assert_manifold_result(result)
-    assert result.stats["surface_style"] == "v2-safe-fallback"
-    assert not result.stats["v2_accepted"]
-    assert np.array_equal(result.quads, baseline.quads)
-    assert result.faces.shape == baseline.faces.shape
-    assert np.allclose(result.vertices, baseline.vertices)
-
-
-def test_v2_improves_curved_surface_without_changing_topology():
-    source = trimesh.creation.icosphere(subdivisions=3, radius=1.0)
-    source_vertices = np.asarray(source.vertices)
-    source_faces = np.asarray(source.faces)
-    baseline = retopologize(source_vertices, source_faces, target_faces=800)
-    result = retopologize(
-        source_vertices,
-        source_faces,
-        target_faces=800,
-        smooth=True,
-    )
-
-    _assert_manifold_result(result)
-    assert result.stats["surface_style"] == "smooth-v2"
-    assert result.stats["v2_accepted"]
-    assert result.stats["v2_profile"] in ("gentle", "balanced", "strong")
-    assert np.array_equal(result.quads, baseline.quads)
-    assert result.faces.shape == baseline.faces.shape
-    assert result.stats["dihedral_p50"] < baseline.stats["dihedral_p50"]
-    assert result.stats["surface_error_p95"] <= baseline.stats["surface_error_p95"] * 1.1
-
-
 def test_open_multishell_source_becomes_one_body():
     body = trimesh.creation.box(extents=[2.0, 1.0, 0.7])
     body.update_faces(np.arange(len(body.faces) - 2))

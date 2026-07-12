@@ -1465,7 +1465,6 @@ def to_glb(
     game_remesh_method: str = "quality",
     game_retopo_sidecar_path: Optional[str] = None,
     experimental_retopo: bool = False,
-    experimental_smooth: bool = False,
     experimental_target_faces: Optional[int] = None,
     experimental_quad_path: Optional[str] = None,
     experimental_normal_path: Optional[str] = None,
@@ -1497,12 +1496,25 @@ def to_glb(
     experimental_reference_faces = None
     experimental_report_stats = None
     experimental_vertex_normals = None
+    experimental_pre_uv_normals = None
 
     if experimental_retopo:
         from sam3d_objects.experimental_retopo import retopologize, write_quad_obj
 
         experimental_reference_vertices = vertices.copy()
         experimental_reference_faces = faces.copy()
+        if verbose:
+            tqdm.write("Building temporary smooth decoder guide for quad fitting")
+        experimental_guide_vertices, experimental_guide_faces = postprocess_mesh(
+            experimental_reference_vertices.copy(),
+            experimental_reference_faces.copy(),
+            simplify=True,
+            simplify_ratio=0.90,
+            fill_holes=False,
+            remove_floaters=True,
+            floater_frac=0.005,
+            verbose=verbose,
+        )
         splat_points = app_rep.get_xyz.detach().float().cpu().numpy()
         splat_scales = app_rep.get_scaling.detach().float().cpu().numpy()
         splat_rotations = app_rep.get_rotation.detach().float().cpu().numpy()
@@ -1517,13 +1529,22 @@ def to_glb(
             faces,
             target_faces=experimental_target_faces,
             verbose=verbose,
-            smooth=experimental_smooth,
             splat_points=splat_points,
             splat_scales=splat_scales,
             splat_rotations=splat_rotations,
             splat_opacity=splat_opacity,
+            guide_vertices=experimental_guide_vertices,
+            guide_faces=experimental_guide_faces,
         )
         vertices, faces = result.vertices, result.faces
+        from sam3d_objects.experimental_retopo import transfer_surface_normals
+
+        experimental_pre_uv_normals = transfer_surface_normals(
+            experimental_guide_vertices,
+            experimental_guide_faces,
+            vertices,
+            faces,
+        )
         if experimental_quad_path:
             export_rotation = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
             write_quad_obj(
@@ -1609,16 +1630,19 @@ def to_glb(
     if with_texture_baking:
         # parametrize mesh
         if experimental_retopo:
-            from sam3d_objects.experimental_retopo import seamless_vertex_normals
-
-            vertices, faces, uvs = parametrize_mesh(vertices, faces)
-            experimental_vertex_normals = seamless_vertex_normals(vertices, faces)
+            vertices, faces, uvs, vmapping = parametrize_mesh(
+                vertices, faces, return_mapping=True
+            )
+            experimental_vertex_normals = experimental_pre_uv_normals[vmapping]
         else:
             vertices, faces, uvs = parametrize_mesh(vertices, faces)
         logger.info("Baking texture ...")
         _emit_progress(progress_callback, "UV unwrap", 1)
 
-        if experimental_retopo and isinstance(app_rep, Gaussian):
+        direct_experimental_color = os.environ.get(
+            "SAM3D_EXPERIMENTAL_DIRECT_COLOR", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if experimental_retopo and isinstance(app_rep, Gaussian) and direct_experimental_color:
             from sam3d_objects.experimental_retopo import bake_gaussian_color_texture
 
             texture = bake_gaussian_color_texture(

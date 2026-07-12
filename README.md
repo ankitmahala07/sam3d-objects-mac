@@ -126,9 +126,8 @@ and GLB output mode, then runs end to end:
 3. **Quality** — diffusion steps for both stages:
    `Low = 10` (default), `Medium = 25`, `High = 50`, or a custom value.
 4. **GLB output** — choose the generated mesh export:
-   `Game` (default), `Unoptimised`, `Both`, `Experimental`, or `Experimental V2`.
-5. **Mesh settings** — shown for `Game`, `Both`, `Experimental`, or
-   `Experimental V2`: target
+   `Game` (default), `Unoptimised`, `Both`, or `Experimental`.
+5. **Mesh settings** — shown for `Game`, `Both`, or `Experimental`: target
    triangle budget.
 
 Output in `outputs/<name>/`:
@@ -146,10 +145,6 @@ Output in `outputs/<name>/`:
 | `mesh_experimental_quads.obj` | editable quad-dominant experimental mesh |
 | `mesh_experimental_normal.png` | optional tangent normal-map sidecar      |
 | `mesh_experimental_report.json` | topology and surface-error measurements |
-| `mesh_experimental_v2.glb` | quality-gated smoother experimental mesh   |
-| `mesh_experimental_v2_quads.obj` | editable V2 quad-dominant mesh        |
-| `mesh_experimental_v2_normal.png` | optional V2 normal-map sidecar         |
-| `mesh_experimental_v2_report.json` | V2 selection and quality measurements |
 
 Multiple views are experimental and memory-sensitive. View 1 drives depth and
 pose; all supplied views are averaged into the Stage 1 and Stage 2 condition
@@ -187,18 +182,10 @@ the surface with an in-repo signed-distance and QEF dual-contouring implementati
 
 No external retopology executable or service is used. The OBJ preserves editable
 quads; the GLB is triangulated for runtime compatibility and receives its texture
-after the experimental topology has been finalized. It also receives a tangent
-normal map baked from the untouched decoded surface, with subtle appearance-based
-relief for cracks and other shallow detail. Local transition or repair triangles
+after the experimental topology has been finalized. An optional tangent normal-map
+sidecar is baked from the untouched decoded surface for shallow detail. Local transition or repair triangles
 may appear around adaptively refined patches or where multiple source sheets meet
 inside one grid cell; their counts are recorded in the JSON report.
-
-`Experimental V2` starts from the exact quad layout accepted by `Experimental`.
-It evaluates gentle, balanced, and strong smoothing candidates, then keeps a
-candidate only when it improves curved-surface roughness without exceeding the
-source-error, triangle-aspect, volume, or sharp-edge limits. Flat and hard-surface
-objects can intentionally fall back to the unchanged experimental mesh. The V2
-report records the selected profile or each rejection reason.
 
 GLB files are runtime meshes and are stored as triangles. Targets below 500
 faces are rejected to avoid accidentally destroying silhouettes.
@@ -224,12 +211,6 @@ Use `auto` instead of a number to pick a target automatically.
 ./run.sh experimental outputs/<name> 2000
 ```
 
-**Create the quality-gated smoother experimental mesh:**
-
-```bash
-./run.sh experimentalv2 outputs/<name> 2000
-```
-
 The face value is the initial runtime-triangle budget. The quality gate may use
 more faces when necessary. Its main limits can be adjusted without changing code:
 
@@ -250,8 +231,13 @@ more faces when necessary. Its main limits can be adjusted without changing code
 | `SAM3D_EXPERIMENTAL_ATTACH_NORMAL_MAP` | `0` | attach the optional tangent normal map to experimental GLBs |
 | `SAM3D_EXPERIMENTAL_NORMAL_STRENGTH` | `0.35` | high-poly geometric normal contribution |
 | `SAM3D_EXPERIMENTAL_ALBEDO_RELIEF` | `0.08` | subtle high-frequency crack/detail contribution |
-| `SAM3D_EXPERIMENTAL_V2_PROFILES` | `3` | number of V2 smoothing candidates to evaluate |
-| `SAM3D_EXPERIMENTAL_V2_VOLUME_CHANGE` | `0.03` | maximum accepted V2 volume change |
+| `SAM3D_EXPERIMENTAL_REFINEMENT_PROFILES` | `3` | number of internal smoothing candidates to evaluate |
+| `SAM3D_EXPERIMENTAL_REFINEMENT_VOLUME_CHANGE` | `0.04` | maximum accepted refinement volume change |
+| `SAM3D_EXPERIMENTAL_POLISH_CHAIN_MAX_COMPONENTS` | `1` | smooth only the longest sharp-edge chain by default |
+| `SAM3D_EXPERIMENTAL_POLISH_CHAIN_ITERS` | `8` | sharp-edge curve fairing iterations |
+| `SAM3D_EXPERIMENTAL_POLISH_CHAIN_WEIGHT` | `0.32` | sharp-edge curve fairing strength |
+| `SAM3D_EXPERIMENTAL_SPLAT_GEOMETRY_WEIGHT` | `0.0` | optional splat influence over geometry; appearance still comes from splats |
+| `SAM3D_EXPERIMENTAL_DIRECT_COLOR` | `0` | use faster direct splat color instead of the smoother streamed texture bake |
 
 ---
 

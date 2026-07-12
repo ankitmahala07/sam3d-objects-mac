@@ -5,7 +5,6 @@
 #   ./run.sh glb <dir>  re-convert one output dir's splat.ply → mesh.glb
 #   ./run.sh game <dir> [faces]  create mesh_game.glb with a pre-bake game mesh
 #   ./run.sh experimental <dir> [faces]  create the separate experimental mesh
-#   ./run.sh experimentalv2 <dir> [faces]  experimental mesh with a smoothed surface
 #
 # The full flow runs in two separate processes on purpose: the CLI generates the
 # splat and then EXITS, so macOS reclaims all of its model memory before the GLB
@@ -132,16 +131,6 @@ if [[ "$1" == "experimental" ]]; then
         "${2:-}"
 fi
 
-# --- experimentalv2: the experimental mesh with a smoothed (non-blocky) surface --
-if [[ "$1" == "experimentalv2" || "$1" == "experimentalV2" || "$1" == "experimental-v2" || "$1" == "experimental_v2" ]]; then
-    check_models
-    wait_for_memory 12
-    exec "$PY" "$SCRIPT_DIR/ply2glb.py" \
-        --experimental-v2 \
-        --target-faces "${3:-auto}" \
-        "${2:-}"
-fi
-
 # Only "", "full" run the full flow; anything else is a mistake — show usage.
 if [[ -n "$1" && "$1" != "full" ]]; then
     echo "Usage:"
@@ -149,7 +138,6 @@ if [[ -n "$1" && "$1" != "full" ]]; then
     echo "  ./run.sh glb <dir>            re-convert splat.ply -> mesh.glb"
     echo "  ./run.sh game <dir> [faces]   pre-bake welded game mesh -> mesh_game.glb"
     echo "  ./run.sh experimental <dir> [faces]  custom quad mesh -> mesh_experimental.glb"
-    echo "  ./run.sh experimentalv2 <dir> [faces]  smoothed quad mesh -> mesh_experimental_v2.glb"
     exit 1
 fi
 
@@ -200,13 +188,6 @@ while IFS=$'\t' read -r objdir progress_done progress_total export_mode game_tar
         SAM3D_PROGRESS_TOTAL="${progress_total:-0}" \
         "$PY" "$SCRIPT_DIR/ply2glb.py" \
             --experimental \
-            --target-faces "$game_target" \
-            "$objdir"
-    elif [[ "$export_mode" == "experimentalv2" || "$export_mode" == "experimental-v2" ]]; then
-        SAM3D_PROGRESS_DONE="${progress_done:-0}" \
-        SAM3D_PROGRESS_TOTAL="${progress_total:-0}" \
-        "$PY" "$SCRIPT_DIR/ply2glb.py" \
-            --experimental-v2 \
             --target-faces "$game_target" \
             "$objdir"
     elif [[ "$export_mode" == "unoptimised" || "$export_mode" == "unoptimized" ]]; then

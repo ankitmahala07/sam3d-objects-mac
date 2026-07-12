@@ -58,6 +58,30 @@ def seamless_vertex_normals(
     return welded[inverse]
 
 
+def transfer_surface_normals(
+    source_vertices: np.ndarray,
+    source_faces: np.ndarray,
+    target_vertices: np.ndarray,
+    target_faces: np.ndarray,
+) -> np.ndarray:
+    """Transfer interpolated smooth normals from a dense guide to a retopo mesh."""
+    source_vertices = np.asarray(source_vertices, dtype=np.float32)
+    source_faces = np.asarray(source_faces, dtype=np.int64)
+    target_vertices = np.asarray(target_vertices, dtype=np.float32)
+    source_normals = smooth_vertex_normals(source_vertices, source_faces)
+    scene = _make_scene(source_vertices, source_faces)
+    transferred = _closest_smooth_normals(
+        scene,
+        target_vertices,
+        source_faces,
+        source_normals,
+    )
+    target_normals = smooth_vertex_normals(target_vertices, target_faces)
+    opposite = np.einsum("ij,ij->i", transferred, target_normals) < 0.0
+    transferred[opposite] *= -1.0
+    return _normalize(transferred)
+
+
 def _clean_reference(vertices: np.ndarray, faces: np.ndarray) -> trimesh.Trimesh:
     vertices = np.asarray(vertices, dtype=np.float64)
     faces = np.asarray(faces, dtype=np.int64)
@@ -216,7 +240,7 @@ def bake_gaussian_color_texture(
     opacity = opacity[valid]
     normals = normals[valid]
     tree = cKDTree(points)
-    neighbors = max(4, int(_env_float("SAM3D_EXPERIMENTAL_COLOR_NEIGHBORS", 16)))
+    neighbors = max(4, int(_env_float("SAM3D_EXPERIMENTAL_COLOR_NEIGHBORS", 48)))
     neighbors = min(neighbors, points.shape[0])
     chunk_size = 100_000
     baked = np.zeros((covered.shape[0], 3), dtype=np.float32)

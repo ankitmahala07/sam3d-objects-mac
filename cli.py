@@ -49,7 +49,7 @@ def int_env(name, default=0):
 
 
 def export_progress_units(mode):
-    if mode in ("game", "experimental", "experimentalv2"):
+    if mode in ("game", "experimental"):
         return 11
     if mode == "both":
         return 21
@@ -176,7 +176,7 @@ def _multi_view_note(image_views):
 def _image_extract_step(export_mode):
     return (
         "STEP 6"
-        if export_mode in ("game", "both", "experimental", "experimentalv2")
+        if export_mode in ("game", "both", "experimental")
         else "STEP 5"
     )
 
@@ -271,9 +271,8 @@ def get_export_mode():
     print(f"       [2] Unoptimised ·  original high-detail mesh")
     print(f"       [3] Both        ·  mesh_game.glb + mesh.glb")
     print(f"       [4] Experimental ·  in-repo quad-dominant retopology")
-    print(f"       [5] Experimental V2 ·  quality-gated smoother quad retopology")
     while True:
-        raw = ask("Enter 1–5", 1)
+        raw = ask("Enter 1–4", 1)
         if raw == "1":
             ok("Game output → mesh_game.glb")
             return "game"
@@ -286,17 +285,14 @@ def get_export_mode():
         if raw == "4":
             ok("Experimental output → mesh_experimental.glb + mesh_experimental_quads.obj")
             return "experimental"
-        if raw == "5":
-            ok("Experimental V2 output → mesh_experimental_v2.glb")
-            return "experimentalv2"
-        err("Enter a number between 1 and 5.")
+        err("Enter a number between 1 and 4.")
 
 
 def get_game_options(export_mode):
-    if export_mode not in ("game", "both", "experimental", "experimentalv2"):
+    if export_mode not in ("game", "both", "experimental"):
         return "auto", "quality"
 
-    if export_mode in ("experimental", "experimentalv2"):
+    if export_mode == "experimental":
         hdr("STEP 5 — EXPERIMENTAL GENERATION")
         print(f"  {B}?{RST}  Initial triangle budget for experimental retopology")
         print(f"       The quality gate may raise this budget to preserve the source surface.")
@@ -313,9 +309,8 @@ def get_game_options(export_mode):
             break
         err("Enter auto or a number >= 500.")
 
-    if export_mode in ("experimental", "experimentalv2"):
-        label = "Experimental V2" if export_mode == "experimentalv2" else "Experimental"
-        ok(f"{label} generation: quad-dominant target={target}")
+    if export_mode == "experimental":
+        ok(f"Experimental generation: quad-dominant target={target}")
         return target, export_mode
     ok(f"Game mesh: welded quality-safe target={target}")
     return target, "quality"
