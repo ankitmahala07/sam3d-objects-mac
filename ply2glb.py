@@ -5,10 +5,8 @@ ply2glb — Convert a SAM-3D gaussian splat to a textured GLB mesh.
 Usage:
     python ply2glb.py <output_folder>
     python ply2glb.py --game-ready --target-faces 2000 <output_folder>
-    python ply2glb.py --experimental --target-faces 2000 <output_folder>
     ./run.sh glb <output_folder>
     ./run.sh game <output_folder> [target_faces]
-    ./run.sh experimental <output_folder> [target_faces]
 
 Loads only the mesh decoder (~500 MB), not the full inference pipeline.
 Requires slat.pt and splat.ply to exist in <output_folder>.
@@ -106,25 +104,20 @@ def parse_args():
         "--game-ready",
         "--remesh",
         action="store_true",
-        help="Create a quality-safe game mesh before UV unwrap and texture baking, writing mesh_game.glb.",
-    )
-    parser.add_argument(
-        "--experimental",
-        action="store_true",
-        help="Create an in-repo quad-dominant experimental mesh, writing mesh_experimental.glb.",
+        help="Create a quad-retopo game mesh before UV unwrap and texture baking, writing mesh_game.glb.",
     )
     parser.add_argument(
         "--target-faces",
         default="auto",
         help=(
-            "Target triangle count for game or experimental output. "
+            "Target triangle count for game output. "
             "Use 'auto' or an integer >= 500."
         ),
     )
     parser.add_argument(
         "--remesh-method",
         default="quality",
-        help="Game mesh method. Default is quality-safe.",
+        help="Accepted for compatibility; game exports use quad retopology.",
     )
     parser.add_argument(
         "--output",
@@ -190,27 +183,20 @@ def main():
     print(f"\n{BOLD}{W}  ply2glb  ·  Gaussian splat → Textured GLB{RST}")
     args = parse_args()
 
-    experimental_mode = args.experimental
-    if args.game_ready and experimental_mode:
-        err("Choose either --game-ready or --experimental, not both.")
+    quad_retopo_mode = args.game_ready
 
     if not args.folder:
         print(
             f"  Usage: {sys.argv[0]} "
-            "[--game-ready|--experimental "
-            "--target-faces auto|N] <output_folder>"
+            "[--game-ready --target-faces auto|N] <output_folder>"
         )
         sys.exit(1)
 
     folder = os.path.abspath(args.folder.strip().strip("'\""))
     ply_path  = os.path.join(folder, "splat.ply")
     slat_path = os.path.join(folder, "slat.pt")
-    experimental_base = "mesh_experimental"
-    default_name = (
-        f"{experimental_base}.glb" if experimental_mode
-        else "mesh_game.glb" if args.game_ready
-        else "mesh.glb"
-    )
+    game_sidecar_base = "mesh_game"
+    default_name = "mesh_game.glb" if args.game_ready else "mesh.glb"
     out_name = args.output or default_name
     glb_path  = os.path.join(folder, out_name)
     target_faces = parse_target_faces(args.target_faces)
@@ -228,14 +214,9 @@ def main():
     )
     ok(f"Device: {render_device}")
     if args.game_ready:
-        ok(f"Game-ready remesh: target={target_faces or 'auto'}")
-        ok("Game-ready method: quality-safe welded mesh export")
-    elif experimental_mode:
-        ok(f"Experimental generation: target={target_faces or 'auto'}")
-        ok("Experimental method: decoder-guided quad fit + post-retopo streamed texture")
-    progress = make_progress(
-        extra_units=2 if experimental_mode else 1 if args.game_ready else 0
-    )
+        ok(f"Game-ready mesh: target={target_faces or 'auto'}")
+        ok("Game-ready method: quad retopology + post-retopo streamed texture")
+    progress = make_progress(extra_units=2 if quad_retopo_mode else 0)
 
     hdr("LOADING ASSETS")
     progress("phase", label="Load GLB assets")
@@ -290,8 +271,7 @@ def main():
 
     hdr("CLEANUP MESH + BAKE TEXTURE + EXPORT GLB")
     conversion_label = (
-        "Experimental mesh + texture bake" if experimental_mode
-        else "Game mesh + texture bake" if args.game_ready
+        "Game quad mesh + texture bake" if quad_retopo_mode
         else "Cleanup + texture bake"
     )
     progress("phase", label=conversion_label)
@@ -302,26 +282,25 @@ def main():
     texture_views = int_env("SAM3D_TEXTURE_VIEWS", 100)
     texture_render_resolution = int_env("SAM3D_TEXTURE_RENDER_RES", 1024)
     texture_size = int_env("SAM3D_TEXTURE_SIZE", 2048)
-    experimental_temp_dir = None
-    experimental_quad_path = None
-    experimental_normal_path = None
+    game_temp_dir = None
+    game_quad_path = None
+    game_normal_path = None
     export_glb_path = glb_path
-    if experimental_mode:
-        experimental_temp_dir = tempfile.mkdtemp(prefix=".experimental-", dir=folder)
-        experimental_quad_path = os.path.join(
-            experimental_temp_dir,
-            f"{experimental_base}_quads.obj",
+    if quad_retopo_mode:
+        game_temp_dir = tempfile.mkdtemp(prefix=".mesh-game-", dir=folder)
+        game_quad_path = os.path.join(
+            game_temp_dir,
+            f"{game_sidecar_base}_quads.obj",
         )
-        experimental_normal_path = os.path.join(
-            experimental_temp_dir,
-            f"{experimental_base}_normal.png",
+        game_normal_path = os.path.join(
+            game_temp_dir,
+            f"{game_sidecar_base}_normal.png",
         )
-        export_glb_path = os.path.join(experimental_temp_dir, out_name)
+        export_glb_path = os.path.join(game_temp_dir, out_name)
     if on_mps:
         step(
             (
-                "Experimental quad mesh → streamed texture bake " if experimental_mode
-                else "Welded game mesh → streamed texture bake " if args.game_ready
+                "Game quad mesh → streamed texture bake " if quad_retopo_mode
                 else "Mesh cleanup → streamed texture bake "
             )
             + f"({texture_views} views @ {texture_render_resolution}px, {texture_size}px atlas)…"
@@ -337,21 +316,21 @@ def main():
         glb = to_glb(
             gs,
             mesh_result,
-            simplify=0.0 if (args.game_ready or experimental_mode) else 0.90,
+            simplify=0.0 if quad_retopo_mode else 0.90,
             fill_holes=True,
             fill_holes_resolution=512 if on_mps else 1024,
             fill_holes_num_views=100 if on_mps else 1000,
             texture_size=texture_size,
             texture_views=texture_views,
             texture_render_resolution=texture_render_resolution,
-            game_remesh=args.game_ready,
+            game_remesh=False,
             game_target_faces=target_faces,
             game_remesh_method=remesh_method,
             game_retopo_sidecar_path=None,
-            experimental_retopo=experimental_mode,
+            experimental_retopo=quad_retopo_mode,
             experimental_target_faces=target_faces,
-            experimental_quad_path=experimental_quad_path,
-            experimental_normal_path=experimental_normal_path,
+            experimental_quad_path=game_quad_path,
+            experimental_normal_path=game_normal_path,
             texture_mode="average",  # smooth angle-weighted multi-view average (no Adam patchiness)
             with_mesh_postprocess=True,   # includes floater removal (remove_floaters default on)
             with_texture_baking=True,
@@ -361,32 +340,32 @@ def main():
         )
         ok(f"GLB ready  ({time.time()-t0:.1f}s)")
         glb.export(export_glb_path)
-        if experimental_mode:
+        if quad_retopo_mode:
             os.replace(
-                experimental_quad_path,
-                os.path.join(folder, f"{experimental_base}_quads.obj"),
+                game_quad_path,
+                os.path.join(folder, f"{game_sidecar_base}_quads.obj"),
             )
             os.replace(
-                experimental_quad_path.replace("_quads.obj", "_report.json"),
-                os.path.join(folder, f"{experimental_base}_report.json"),
+                game_quad_path.replace("_quads.obj", "_report.json"),
+                os.path.join(folder, f"{game_sidecar_base}_report.json"),
             )
             os.replace(
-                experimental_normal_path,
-                os.path.join(folder, f"{experimental_base}_normal.png"),
+                game_normal_path,
+                os.path.join(folder, f"{game_sidecar_base}_normal.png"),
             )
             os.replace(export_glb_path, glb_path)
     finally:
-        if experimental_temp_dir:
-            shutil.rmtree(experimental_temp_dir, ignore_errors=True)
+        if game_temp_dir:
+            shutil.rmtree(game_temp_dir, ignore_errors=True)
     progress.advance("Export GLB", 1)
     if bool_env("SAM3D_PROGRESS_FINISH", True):
         progress.finish("Complete")
     else:
         progress.close()
     saved(out_name, glb_path)
-    if experimental_mode:
+    if quad_retopo_mode:
         for suffix in ("quads.obj", "report.json", "normal.png"):
-            label = f"{experimental_base}_{suffix}"
+            label = f"{game_sidecar_base}_{suffix}"
             saved(label, os.path.join(folder, label))
 
     hdr("DONE")

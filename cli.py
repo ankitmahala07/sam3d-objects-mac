@@ -3,19 +3,19 @@
 SAM-3D Objects — CLI  (Apple Silicon / MPS)
 
 Streamlined full pipeline:
-    1. Ask for one image, or multiple views of the same object. Images are
-       treated as raw photos — the background is removed here with rembg, so
-       you never need to pre-extract them.
+    1. Ask for one image, multiple views of the same object, or a folder batch.
+       Images are treated as raw photos — the background is removed here with
+       rembg, so you never need to pre-extract them.
     2. Ask for an output folder name  (created as  ./outputs/<name>/ )
     3. Pick quality and export mode
     4. Run the full 3D pipeline immediately  (voxel → gaussian splat)
 
 Writes  extracted.png, optional extracted_view_*.png, splat.ply, slat.pt
-into  outputs/<name>/.
+into  outputs/<name>/  or  outputs/<batch>/<image-name>/.
 The textured GLB is produced afterwards by ply2glb.py (see  ./run.sh  →  full flow).
 """
 
-import sys, os, subprocess, time, random
+import sys, os, subprocess, time, random, re, argparse, gc
 import numpy as np
 from PIL import Image as PILImage
 from sam3d_progress import CliProgress
@@ -41,6 +41,9 @@ def warn(msg):  print(f"  {Y}⚠{RST}   {msg}")
 def err(msg):   print(f"  {R}✗{RST}   {msg}")
 
 
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+
+
 def int_env(name, default=0):
     try:
         return int(os.environ.get(name, str(default)))
@@ -49,7 +52,7 @@ def int_env(name, default=0):
 
 
 def export_progress_units(mode):
-    if mode in ("game", "experimental"):
+    if mode == "game":
         return 11
     if mode == "both":
         return 21
@@ -73,19 +76,68 @@ def _load_rgb_image(path):
     return path, img, np.array(img.convert("RGB"))
 
 
+def _probe_image(path):
+    with PILImage.open(path) as img:
+        img.load()
+        return img.width, img.height
+
+
+def _safe_folder_name(value):
+    stem = os.path.splitext(os.path.basename(value.rstrip("/")))[0]
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-")
+    return stem or "image"
+
+
+def _discover_image_files(folder):
+    paths = []
+    for name in sorted(os.listdir(folder), key=str.lower):
+        path = os.path.join(folder, name)
+        if not os.path.isfile(path):
+            continue
+        if os.path.splitext(name)[1].lower() in IMAGE_EXTENSIONS:
+            paths.append(path)
+    return paths
+
+
+def _materialize_job_views(job):
+    if "views" in job:
+        return job["views"]
+    views = []
+    for path in job["paths"]:
+        path, img, rgb = _load_rgb_image(path)
+        ok(f"{img.width}×{img.height}  ←  {path}")
+        views.append({"path": path, "rgb": rgb})
+    return views
+
+
+def _child_output_dir(batch_root, image_path, used_names):
+    base = _safe_folder_name(image_path)
+    name = base
+    idx = 2
+    while name in used_names:
+        name = f"{base}_{idx:02d}"
+        idx += 1
+    used_names.add(name)
+    return os.path.join(batch_root, name)
+
+
 # ── prompts ───────────────────────────────────────────────────────────────────
-def get_image_views():
-    """Ask for one image or multiple views. The first view is the primary
-    geometry/depth view; extra views are used as conditioning references."""
+def get_image_jobs():
+    """Ask for one image, multiple views, or a folder batch.
+
+    Folder batches keep only file paths in memory. Each image is later handled
+    by a fresh worker process so overnight runs do not accumulate MPS state.
+    """
     hdr("STEP 1 — IMAGES")
     print(f"  {B}?{RST}  Image input")
     print(f"     {G}▶{RST} [1] Single image")
     print(f"       [2] Multiple views of the same object")
+    print(f"       [3] Folder of images (sequential overnight batch)")
     while True:
-        mode = ask("Enter 1–2", 1)
-        if mode in ("1", "2"):
+        mode = ask("Enter 1–3", 1)
+        if mode in ("1", "2", "3"):
             break
-        err("Enter 1 or 2.")
+        err("Enter 1, 2, or 3.")
 
     if mode == "1":
         while True:
@@ -93,11 +145,34 @@ def get_image_views():
             try:
                 path, img, rgb = _load_rgb_image(path)
                 ok(f"{img.width}×{img.height}  ←  {path}")
-                return [{"path": path, "rgb": rgb}]
+                return [{"name": None, "views": [{"path": path, "rgb": rgb}]}], False
             except FileNotFoundError:
                 err(f"File not found: {os.path.expanduser(path)}")
             except Exception as e:
                 err(f"Could not open: {e}")
+
+    if mode == "3":
+        while True:
+            folder = os.path.abspath(os.path.expanduser(ask("Image folder path (drag folder here)").strip().strip("'\"")))
+            if not os.path.isdir(folder):
+                err(f"Folder not found: {folder}")
+                continue
+            files = _discover_image_files(folder)
+            if not files:
+                err("No supported image files found (.png, .jpg, .jpeg, .webp, .bmp, .tif, .tiff).")
+                continue
+            jobs = []
+            for path in files:
+                try:
+                    width, height = _probe_image(path)
+                    ok(f"Queued {os.path.basename(path)}  ({width}×{height})")
+                    jobs.append({"name": _safe_folder_name(path), "paths": [path]})
+                except Exception as e:
+                    warn(f"Skipping {path}: {e}")
+            if jobs:
+                ok(f"{len(jobs)} image(s) queued for sequential generation")
+                return jobs, True
+            err("No readable images found in that folder.")
 
     while True:
         raw_count = ask("Number of views", 2).strip()
@@ -122,7 +197,7 @@ def get_image_views():
             except Exception as e:
                 err(f"Could not open: {e}")
     ok(f"{len(views)} view(s) loaded")
-    return views
+    return [{"name": None, "views": views}], False
 
 
 def _extract_masks(image_views):
@@ -176,7 +251,7 @@ def _multi_view_note(image_views):
 def _image_extract_step(export_mode):
     return (
         "STEP 6"
-        if export_mode in ("game", "both", "experimental")
+        if export_mode in ("game", "both")
         else "STEP 5"
     )
 
@@ -216,13 +291,14 @@ def _warn_multi_view_cost(image_views):
         warn("Multiple views compute extra depth/condition embeddings; use 2–4 views on 24 GB Macs.")
 
 
-def get_output_folder():
+def get_output_folder(batch_mode=False):
     """Ask for a name only; the folder is always created under ./outputs/<name>/."""
     hdr("STEP 2 — OUTPUT NAME")
     outputs_root = os.path.join(ROOT, "outputs")
     os.makedirs(outputs_root, exist_ok=True)
     while True:
-        name = ask("Output folder name").strip().strip("'\"")
+        prompt = "Batch output folder name" if batch_mode else "Output folder name"
+        name = ask(prompt).strip().strip("'\"")
         # Only a name is allowed — strip any path the user may have pasted.
         name = os.path.basename(name.rstrip("/"))
         if not name:
@@ -230,7 +306,10 @@ def get_output_folder():
             continue
         folder = os.path.join(outputs_root, name)
         os.makedirs(folder, exist_ok=True)
-        ok(f"→ {folder}")
+        if batch_mode:
+            ok(f"Batch root → {folder}")
+        else:
+            ok(f"→ {folder}")
         return folder
 
 
@@ -267,12 +346,11 @@ def get_steps():
 def get_export_mode():
     hdr("STEP 4 — GLB OUTPUT")
     print(f"  {B}?{RST}  Which GLB should be generated?")
-    print(f"     {G}▶{RST} [1] Game        ·  welded low-poly game mesh (default)")
+    print(f"     {G}▶{RST} [1] Game        ·  quad-retopo low-poly game mesh (default)")
     print(f"       [2] Unoptimised ·  original high-detail mesh")
     print(f"       [3] Both        ·  mesh_game.glb + mesh.glb")
-    print(f"       [4] Experimental ·  in-repo quad-dominant retopology")
     while True:
-        raw = ask("Enter 1–4", 1)
+        raw = ask("Enter 1–3", 1)
         if raw == "1":
             ok("Game output → mesh_game.glb")
             return "game"
@@ -282,24 +360,16 @@ def get_export_mode():
         if raw == "3":
             ok("Both outputs → mesh_game.glb and mesh.glb")
             return "both"
-        if raw == "4":
-            ok("Experimental output → mesh_experimental.glb + mesh_experimental_quads.obj")
-            return "experimental"
-        err("Enter a number between 1 and 4.")
+        err("Enter a number between 1 and 3.")
 
 
 def get_game_options(export_mode):
-    if export_mode not in ("game", "both", "experimental"):
+    if export_mode not in ("game", "both"):
         return "auto", "quality"
 
-    if export_mode == "experimental":
-        hdr("STEP 5 — EXPERIMENTAL GENERATION")
-        print(f"  {B}?{RST}  Initial triangle budget for experimental retopology")
-        print(f"       The quality gate may raise this budget to preserve the source surface.")
-    else:
-        hdr("STEP 5 — GAME MESH")
-        print(f"  {B}?{RST}  Target triangle budget for the game mesh")
-        print(f"       The exporter may keep more faces when needed to preserve the object.")
+    hdr("STEP 5 — GAME MESH")
+    print(f"  {B}?{RST}  Target triangle budget for the game mesh")
+    print(f"       The quad-retopo exporter may keep more faces when needed to preserve the object.")
     print(f"       Examples: 2000 for simple props, 10000 for complex objects")
     while True:
         target = ask("Target faces, or auto", "auto").strip().lower()
@@ -309,10 +379,7 @@ def get_game_options(export_mode):
             break
         err("Enter auto or a number >= 500.")
 
-    if export_mode == "experimental":
-        ok(f"Experimental generation: quad-dominant target={target}")
-        return target, export_mode
-    ok(f"Game mesh: welded quality-safe target={target}")
+    ok(f"Game mesh: quad-retopo target={target}")
     return target, "quality"
 
 
@@ -403,6 +470,9 @@ def run_pipeline(image_views, masks, obj_dir, steps, export_mode, game_target, g
             return False
         progress.close()
         raise
+    except Exception:
+        progress.close()
+        raise
 
     gs = output.get("gs") or output["gaussian"][0]
     finite_tensors = (gs.get_xyz, gs._features_dc, gs._scaling, gs._rotation, gs._opacity)
@@ -451,7 +521,117 @@ def run_pipeline(image_views, masks, obj_dir, steps, export_mode, game_target, g
                 f"{obj_dir}\t{progress.done}\t{progress.total}\t"
                 f"{export_mode}\t{game_target}\t{game_method}\n"
             )
+    del pipeline, output, gs
+    gc.collect()
+    if _t.backends.mps.is_available():
+        _t.mps.empty_cache()
     return True
+
+
+# ── batch helpers ─────────────────────────────────────────────────────────────
+def _parse_worker_args(argv):
+    if "--batch-worker" not in argv:
+        return None
+    parser = argparse.ArgumentParser(description="Run one queued SAM-3D batch item.")
+    parser.add_argument("--batch-worker", action="store_true")
+    parser.add_argument("--image", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--steps", required=True, type=int)
+    parser.add_argument("--export-mode", required=True, choices=("game", "unoptimised", "both"))
+    parser.add_argument("--game-target", default="auto")
+    parser.add_argument("--game-method", default="quality")
+    return parser.parse_args(argv)
+
+
+def _append_batch_failure(batch_root, item_name, message):
+    path = os.path.join(batch_root, "batch_errors.log")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{item_name}\t{message}\n")
+
+
+def _run_batch_worker(args):
+    print(f"\n{BOLD}{M}  SAM-3D Objects  ·  Batch item{RST}")
+    print(f"{DIM}  Apple Silicon / MPS  ·  rembg + gaussian splat{RST}")
+    os.makedirs(args.output_dir, exist_ok=True)
+    try:
+        image_views = _materialize_job_views({"paths": [args.image]})
+        masks = _run_rembg(image_views, args.export_mode)
+        ok(f"Output → {args.output_dir}")
+        success = run_pipeline(
+            image_views,
+            masks,
+            args.output_dir,
+            args.steps,
+            args.export_mode,
+            args.game_target,
+            args.game_method,
+        )
+        hdr("ITEM DONE")
+        return 0 if success else 2
+    except KeyboardInterrupt:
+        print()
+        err("Interrupted")
+        return 130
+    except Exception as e:
+        err(f"Batch item failed: {e}")
+        return 1
+
+
+def _run_folder_batch(jobs, batch_root, steps, export_mode, game_target, game_method):
+    hdr("BATCH QUEUE")
+    ok(f"{len(jobs)} image(s) will run sequentially")
+    ok(f"Batch root: {batch_root}")
+    failures = []
+    used_names = set()
+    for idx, job in enumerate(jobs, start=1):
+        image_path = job["paths"][0]
+        item_name = job["name"]
+        obj_dir = _child_output_dir(batch_root, image_path, used_names)
+        hdr(f"BATCH {idx}/{len(jobs)} — {item_name}")
+        cmd = [
+            sys.executable,
+            os.path.abspath(__file__),
+            "--batch-worker",
+            "--image",
+            image_path,
+            "--output-dir",
+            obj_dir,
+            "--steps",
+            str(steps),
+            "--export-mode",
+            export_mode,
+            "--game-target",
+            str(game_target),
+            "--game-method",
+            str(game_method),
+        ]
+        try:
+            result = subprocess.run(cmd, env=os.environ.copy())
+            if result.returncode == 0:
+                ok(f"Queued GLB conversion for {item_name}")
+            else:
+                message = f"generation exited with status {result.returncode}"
+                warn(f"{item_name}: {message}; continuing")
+                _append_batch_failure(batch_root, item_name, message)
+                failures.append((item_name, message))
+        except KeyboardInterrupt:
+            print()
+            err("Batch interrupted")
+            raise
+        except Exception as e:
+            message = str(e)
+            warn(f"{item_name}: {message}; continuing")
+            _append_batch_failure(batch_root, item_name, message)
+            failures.append((item_name, message))
+        finally:
+            gc.collect()
+    hdr("BATCH SPLAT SUMMARY")
+    ok(f"Succeeded: {len(jobs) - len(failures)}")
+    if failures:
+        warn(f"Failed: {len(failures)}  (see {os.path.join(batch_root, 'batch_errors.log')})")
+    else:
+        ok("Failed: 0")
+    return not failures
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -459,12 +639,18 @@ def main():
     print(f"\n{BOLD}{M}  SAM-3D Objects  ·  CLI{RST}")
     print(f"{DIM}  Apple Silicon / MPS  ·  rembg + gaussian splat{RST}")
 
-    image_views = get_image_views()
-    obj_dir = get_output_folder()
+    jobs, batch_mode = get_image_jobs()
+    obj_dir = get_output_folder(batch_mode=batch_mode)
     steps = get_steps()
     export_mode = get_export_mode()
     game_target, game_method = get_game_options(export_mode)
 
+    if batch_mode:
+        _run_folder_batch(jobs, obj_dir, steps, export_mode, game_target, game_method)
+        hdr("ALL DONE")
+        return
+
+    image_views = _materialize_job_views(jobs[0])
     # Always extract every supplied view: find the largest foreground component
     # with rembg, then merge that mask into RGBA before generation.
     masks = _run_rembg(image_views, export_mode)
@@ -474,4 +660,7 @@ def main():
 
 
 if __name__ == "__main__":
+    worker_args = _parse_worker_args(sys.argv[1:])
+    if worker_args is not None:
+        sys.exit(_run_batch_worker(worker_args))
     main()

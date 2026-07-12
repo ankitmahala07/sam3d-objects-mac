@@ -3,12 +3,12 @@
 #
 #   ./run.sh            image → gaussian splat → chosen textured GLB output
 #   ./run.sh glb <dir>  re-convert one output dir's splat.ply → mesh.glb
-#   ./run.sh game <dir> [faces]  create mesh_game.glb with a pre-bake game mesh
-#   ./run.sh experimental <dir> [faces]  create the separate experimental mesh
+#   ./run.sh game <dir> [faces]  create mesh_game.glb with quad retopology
 #
-# The full flow runs in two separate processes on purpose: the CLI generates the
-# splat and then EXITS, so macOS reclaims all of its model memory before the GLB
-# decoder loads. Only one memory-heavy stage is ever alive at a time.
+# The full flow keeps memory-heavy stages in separate processes on purpose:
+# single-image runs exit the CLI before GLB conversion, and folder batches spawn
+# one fresh splat worker per image. macOS can reclaim model memory before the
+# mesh decoder loads.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -121,23 +121,12 @@ if [[ "$1" == "game" || "$1" == "remesh" ]]; then
         "${2:-}"
 fi
 
-# --- experimental: custom quad-dominant retopology from an existing splat -------
-if [[ "$1" == "experimental" ]]; then
-    check_models
-    wait_for_memory 12
-    exec "$PY" "$SCRIPT_DIR/ply2glb.py" \
-        --experimental \
-        --target-faces "${3:-auto}" \
-        "${2:-}"
-fi
-
 # Only "", "full" run the full flow; anything else is a mistake — show usage.
 if [[ -n "$1" && "$1" != "full" ]]; then
     echo "Usage:"
     echo "  ./run.sh [full]               image -> gaussian splat -> textured GLB"
     echo "  ./run.sh glb <dir>            re-convert splat.ply -> mesh.glb"
-    echo "  ./run.sh game <dir> [faces]   pre-bake welded game mesh -> mesh_game.glb"
-    echo "  ./run.sh experimental <dir> [faces]  custom quad mesh -> mesh_experimental.glb"
+    echo "  ./run.sh game <dir> [faces]   quad-retopo game mesh -> mesh_game.glb"
     exit 1
 fi
 
@@ -150,8 +139,8 @@ MANIFEST="$(mktemp /tmp/sam3d_manifest.XXXXXX)"
 echo "──────────────────────────────────────────────"
 echo "  STAGE 1/2 — SPLAT GENERATION"
 echo "──────────────────────────────────────────────"
-# cli.py records the output dir into $SAM3D_MANIFEST, then exits so the OS
-# reclaims ALL of its model memory before the GLB step starts.
+# cli.py records successful output dirs into $SAM3D_MANIFEST. For folder batches
+# it spawns one fresh worker per image, then exits before the GLB step starts.
 SAM3D_MANIFEST="$MANIFEST" "$PY" "$SCRIPT_DIR/cli.py"
 
 if [[ ! -s "$MANIFEST" ]]; then
@@ -168,6 +157,25 @@ wait_for_memory 12
 echo "──────────────────────────────────────────────"
 echo "  STAGE 2/2 — GLB CONVERSION"
 echo "──────────────────────────────────────────────"
+glb_successes=0
+glb_failures=0
+
+run_conversion() {
+    local label="$1"
+    shift
+    set +e
+    "$@"
+    local status=$?
+    set -e
+    if (( status == 0 )); then
+        glb_successes=$((glb_successes + 1))
+        return 0
+    fi
+    echo "  ⚠ GLB conversion failed for ${label} (exit ${status}) — continuing."
+    glb_failures=$((glb_failures + 1))
+    return 0
+}
+
 while IFS=$'\t' read -r objdir progress_done progress_total export_mode game_target game_method; do
     [[ -z "$objdir" ]] && continue
     export_mode="${export_mode:-game}"
@@ -176,43 +184,43 @@ while IFS=$'\t' read -r objdir progress_done progress_total export_mode game_tar
     wait_for_memory 12          # cheap if already free; guards multi-object runs
     echo "  → $objdir"
     if [[ "$export_mode" == "game" ]]; then
-        SAM3D_PROGRESS_DONE="${progress_done:-0}" \
-        SAM3D_PROGRESS_TOTAL="${progress_total:-0}" \
-        "$PY" "$SCRIPT_DIR/ply2glb.py" \
+        run_conversion "$objdir (game)" env \
+            SAM3D_PROGRESS_DONE="${progress_done:-0}" \
+            SAM3D_PROGRESS_TOTAL="${progress_total:-0}" \
+            "$PY" "$SCRIPT_DIR/ply2glb.py" \
             --game-ready \
             --target-faces "$game_target" \
             --remesh-method "$game_method" \
             "$objdir"
-    elif [[ "$export_mode" == "experimental" ]]; then
-        SAM3D_PROGRESS_DONE="${progress_done:-0}" \
-        SAM3D_PROGRESS_TOTAL="${progress_total:-0}" \
-        "$PY" "$SCRIPT_DIR/ply2glb.py" \
-            --experimental \
-            --target-faces "$game_target" \
-            "$objdir"
     elif [[ "$export_mode" == "unoptimised" || "$export_mode" == "unoptimized" ]]; then
-        SAM3D_PROGRESS_DONE="${progress_done:-0}" \
-        SAM3D_PROGRESS_TOTAL="${progress_total:-0}" \
-        "$PY" "$SCRIPT_DIR/ply2glb.py" "$objdir"
+        run_conversion "$objdir (unoptimised)" env \
+            SAM3D_PROGRESS_DONE="${progress_done:-0}" \
+            SAM3D_PROGRESS_TOTAL="${progress_total:-0}" \
+            "$PY" "$SCRIPT_DIR/ply2glb.py" "$objdir"
     elif [[ "$export_mode" == "both" ]]; then
-        SAM3D_PROGRESS_DONE="${progress_done:-0}" \
-        SAM3D_PROGRESS_TOTAL="${progress_total:-0}" \
-        SAM3D_PROGRESS_FINISH=0 \
-        "$PY" "$SCRIPT_DIR/ply2glb.py" \
+        run_conversion "$objdir (game)" env \
+            SAM3D_PROGRESS_DONE="${progress_done:-0}" \
+            SAM3D_PROGRESS_TOTAL="${progress_total:-0}" \
+            SAM3D_PROGRESS_FINISH=0 \
+            "$PY" "$SCRIPT_DIR/ply2glb.py" \
             --game-ready \
             --target-faces "$game_target" \
             --remesh-method "$game_method" \
             "$objdir"
         next_progress_done=$(( ${progress_done:-0} + 11 ))
-        SAM3D_PROGRESS_DONE="$next_progress_done" \
-        SAM3D_PROGRESS_TOTAL="${progress_total:-0}" \
-        "$PY" "$SCRIPT_DIR/ply2glb.py" "$objdir"
+        run_conversion "$objdir (unoptimised)" env \
+            SAM3D_PROGRESS_DONE="$next_progress_done" \
+            SAM3D_PROGRESS_TOTAL="${progress_total:-0}" \
+            "$PY" "$SCRIPT_DIR/ply2glb.py" "$objdir"
     else
-        echo "  Unknown GLB output mode: $export_mode"
-        rm -f "$MANIFEST"
-        exit 1
+        echo "  ⚠ Unknown GLB output mode: $export_mode — skipping $objdir"
+        glb_failures=$((glb_failures + 1))
     fi
 done < "$MANIFEST"
 
 rm -f "$MANIFEST"
-echo "  All done."
+if (( glb_failures > 0 )); then
+    echo "  Finished with ${glb_successes} GLB export(s) and ${glb_failures} failure(s)."
+else
+    echo "  All done."
+fi

@@ -118,17 +118,19 @@ checkpoints/hf/checkpoints/
 That's the whole thing. It asks for the source image(s), output folder, quality,
 and GLB output mode, then runs end to end:
 
-1. **Images** — choose either a single ordinary photo or multiple views of the
-   same object. The first view is the primary geometry/depth view; the other
-   views are extra conditioning references. The background is removed
-   automatically (rembg); you do **not** need to pre-extract the object.
-2. **Output folder name** — results are written to `outputs/<name>/`.
+1. **Images** — choose a single ordinary photo, multiple views of the same
+   object, or a folder of images for a sequential overnight batch. The first
+   multi-view image is the primary geometry/depth view; the other views are
+   extra conditioning references. The background is removed automatically
+   (rembg); you do **not** need to pre-extract the object.
+2. **Output folder name** — single/multi-view results are written to
+   `outputs/<name>/`. Folder batches are written as
+   `outputs/<batch-name>/<image-name>/`.
 3. **Quality** — diffusion steps for both stages:
    `Low = 10` (default), `Medium = 25`, `High = 50`, or a custom value.
 4. **GLB output** — choose the generated mesh export:
-   `Game` (default), `Unoptimised`, `Both`, or `Experimental`.
-5. **Mesh settings** — shown for `Game`, `Both`, or `Experimental`: target
-   triangle budget.
+   `Game` (default), `Unoptimised`, or `Both`.
+5. **Mesh settings** — shown for `Game` or `Both`: target triangle budget.
 
 Output in `outputs/<name>/`:
 
@@ -139,37 +141,28 @@ Output in `outputs/<name>/`:
 | `input_views.txt` | optional manifest of the supplied view paths          |
 | `splat.ply`     | the raw gaussian splat                                 |
 | `slat.pt`       | the sparse latent (input to the mesh decoder)          |
-| `mesh_game.glb` | optional/default game-oriented low-poly textured mesh  |
+| `mesh_game.glb` | optional/default quad-retopo game textured mesh        |
+| `mesh_game_quads.obj` | editable quad-dominant game mesh sidecar       |
+| `mesh_game_normal.png` | optional tangent normal-map sidecar            |
+| `mesh_game_report.json` | topology and surface-error measurements       |
 | `mesh.glb`      | optional unoptimised high-detail textured mesh         |
-| `mesh_experimental.glb` | optional experimental textured runtime mesh    |
-| `mesh_experimental_quads.obj` | editable quad-dominant experimental mesh |
-| `mesh_experimental_normal.png` | optional tangent normal-map sidecar      |
-| `mesh_experimental_report.json` | topology and surface-error measurements |
 
-Multiple views are experimental and memory-sensitive. View 1 drives depth and
-pose; all supplied views are averaged into the Stage 1 and Stage 2 condition
-embeddings before generation. Extra views are streamed through the condition
-embedders one at a time to avoid a batch-size memory spike, but they still add
-depth and conditioning work, so 2-4 views is the practical range on a 24 GB Mac.
+Folder batches run one source image at a time. Each image is handled by a fresh
+worker process, then the wrapper converts each successful `splat.ply` to the
+selected GLB output. Failed images are logged to `batch_errors.log` and the queue
+continues.
 
-The `Game` export builds a quality-safe welded mesh before UV unwrap and texture
-baking, so the texture is baked directly onto the exported game asset. The face
-target is treated as a quality hint, not a hard destructive cap: the exporter may
-keep more faces when a low target would damage the silhouette or texture bake.
-Moderate decoded meshes are pre-cleaned before the game reduction, then close
-seams and near-surface fragments are welded into the main mesh on CPU before
-baking. The final game mesh is forced to a single connected body; only unresolved
-leftovers are discarded after the weld attempt. A final sliver pass collapses
-extreme skinny triangles at tips before UV unwrap and texture baking. Long,
-thin props such as spears can keep extra subdivisions when the requested target
-would leave visibly stretched faces. Very large decoded meshes skip the
-pre-clean step to avoid the MPS-heavy cleanup that can crash on million-face
-assets.
-`Both` creates `mesh_game.glb` first and then `mesh.glb` for side-by-side
-comparison.
+Multiple views are memory-sensitive. View 1 drives depth and pose; all supplied
+views are averaged into the Stage 1 and Stage 2 condition embeddings before
+generation. Extra views are streamed through the condition embedders one at a
+time to avoid a batch-size memory spike, but they still add depth and
+conditioning work, so 2-4 views is the practical range on a 24 GB Mac.
 
-The separate `Experimental` export does not use the game remesher. It rebuilds
-the surface with an in-repo signed-distance and QEF dual-contouring implementation:
+The `Game` export rebuilds the surface before UV unwrap and texture baking, so
+the texture is baked directly onto the exported game asset. The face target is
+treated as a quality hint, not a hard destructive cap: the exporter may keep
+more faces when a low target would damage the silhouette or texture bake. It uses
+an in-repo signed-distance and QEF dual-contouring implementation:
 
 1. align a bounded grid to the source object's principal frame;
 2. fit one feature-aware vertex per intersected cell;
@@ -180,12 +173,16 @@ the surface with an in-repo signed-distance and QEF dual-contouring implementati
 7. measure bidirectional surface error and raise the grid resolution when the
    requested budget loses too much shape.
 
-No external retopology executable or service is used. The OBJ preserves editable
-quads; the GLB is triangulated for runtime compatibility and receives its texture
-after the experimental topology has been finalized. An optional tangent normal-map
-sidecar is baked from the untouched decoded surface for shallow detail. Local transition or repair triangles
-may appear around adaptively refined patches or where multiple source sheets meet
-inside one grid cell; their counts are recorded in the JSON report.
+No external retopology executable or service is used. The OBJ sidecar preserves
+editable quads; the GLB is triangulated for runtime compatibility and receives
+its texture after the game topology has been finalized. An optional tangent
+normal-map sidecar is baked from the untouched decoded surface for shallow
+detail. Local transition or repair triangles may appear around adaptively refined
+patches or where multiple source sheets meet inside one grid cell; their counts
+are recorded in the JSON report.
+
+`Both` creates `mesh_game.glb` first and then `mesh.glb` for side-by-side
+comparison.
 
 GLB files are runtime meshes and are stored as triangles. Targets below 500
 faces are rejected to avoid accidentally destroying silhouettes.
@@ -205,14 +202,9 @@ faces are rejected to avoid accidentally destroying silhouettes.
 
 Use `auto` instead of a number to pick a target automatically.
 
-**Create only the separate experimental mesh** from an existing result folder:
-
-```bash
-./run.sh experimental outputs/<name> 2000
-```
-
 The face value is the initial runtime-triangle budget. The quality gate may use
-more faces when necessary. Its main limits can be adjusted without changing code:
+more faces when necessary. The main quad-retopo limits can be adjusted without
+changing code. The environment variable names are kept stable for compatibility:
 
 | Variable | Default | Purpose |
 |----------|--------:|---------|
@@ -227,8 +219,8 @@ more faces when necessary. Its main limits can be adjusted without changing code
 | `SAM3D_EXPERIMENTAL_ADAPTIVE_ERROR` | `0.10` | local source-error threshold in grid-cell diagonals |
 | `SAM3D_EXPERIMENTAL_ADAPTIVE_ANGLE` | `16` | local source-normal threshold in degrees |
 | `SAM3D_EXPERIMENTAL_ADAPTIVE_MAX_TRANSITION_RATIO` | `0.15` | maximum runtime triangle share used by adaptive transitions |
-| `SAM3D_EXPERIMENTAL_NORMAL_SIZE` | texture size | experimental tangent normal-map resolution |
-| `SAM3D_EXPERIMENTAL_ATTACH_NORMAL_MAP` | `0` | attach the optional tangent normal map to experimental GLBs |
+| `SAM3D_EXPERIMENTAL_NORMAL_SIZE` | texture size | tangent normal-map resolution |
+| `SAM3D_EXPERIMENTAL_ATTACH_NORMAL_MAP` | `0` | attach the optional tangent normal map to game GLBs |
 | `SAM3D_EXPERIMENTAL_NORMAL_STRENGTH` | `0.35` | high-poly geometric normal contribution |
 | `SAM3D_EXPERIMENTAL_ALBEDO_RELIEF` | `0.08` | subtle high-frequency crack/detail contribution |
 | `SAM3D_EXPERIMENTAL_REFINEMENT_PROFILES` | `3` | number of internal smoothing candidates to evaluate |
@@ -301,9 +293,11 @@ SAM3D_CPU_DECODE_VOXELS=50000 ./run.sh game outputs/<name> 1600
 
 ## How it works
 
-The run is split into **two separate OS processes** so that only one
-memory-heavy stage is ever resident — macOS only reclaims a process's GPU memory
-when it exits.
+The run is split across **separate OS processes** so that only one memory-heavy
+stage is ever resident — macOS only reclaims a process's GPU memory when it
+exits. Single-image runs exit the CLI before GLB conversion. Folder batches
+spawn one fresh splat worker per image, collect successful outputs, then run the
+GLB conversions afterwards.
 
 ```
  ┌── Stage 1: cli.py ───────────────┐        ┌── Stage 2: ply2glb.py ───────┐

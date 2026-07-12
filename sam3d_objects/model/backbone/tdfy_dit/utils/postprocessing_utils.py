@@ -1556,13 +1556,13 @@ def to_glb(
         experimental_report_stats = result.stats
         if verbose:
             tqdm.write(
-                "After experimental retopo: "
+                "After quad retopo: "
                 f"{result.vertices.shape[0]:,} vertices / "
                 f"{result.quads.shape[0]:,} quads + "
                 f"{result.repair_faces.shape[0]:,} repair triangles / "
                 f"{result.faces.shape[0]:,} runtime triangles"
             )
-        _emit_progress(progress_callback, "Experimental retopo", 1)
+        _emit_progress(progress_callback, "Quad retopo", 1)
 
     elif game_remesh:
         if with_mesh_postprocess:
@@ -1721,7 +1721,7 @@ def to_glb(
                 normal_texture = Image.fromarray(normal_image)
             if experimental_report_stats is not None:
                 experimental_report_stats["normal_map"] = normal_stats
-            _emit_progress(progress_callback, "Experimental normal bake", 1)
+            _emit_progress(progress_callback, "Detail normal bake", 1)
         texture = Image.fromarray(texture)
         material = trimesh.visual.material.PBRMaterial(
             roughnessFactor=1.0,
