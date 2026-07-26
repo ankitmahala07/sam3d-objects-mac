@@ -3065,10 +3065,15 @@ def retopologize(
         )
     reject_aspect = _env_float("SAM3D_EXPERIMENTAL_REJECT_ASPECT_MAX", 100.0)
     if metrics["aspect_max"] > reject_aspect:
-        raise RuntimeError(
-            "Experimental retopo rejected skinny topology "
+        message = (
+            "Experimental retopo produced skinny runtime topology "
             f"(maximum triangle aspect={metrics['aspect_max']:.3f})"
         )
+        if _env_int("SAM3D_EXPERIMENTAL_REJECT_SKINNY_TOPOLOGY", 0):
+            raise RuntimeError(message)
+        if verbose:
+            print(f"{message}; runtime sliver cleanup will run before texture bake")
+        metrics["skinny_topology_warning"] = message
 
     world_vertices = local_output @ axes.T + center
     stats = {

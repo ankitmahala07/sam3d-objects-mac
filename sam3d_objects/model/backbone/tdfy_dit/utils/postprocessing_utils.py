@@ -1,5 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 from typing import *
+from types import SimpleNamespace
 import os
 import numpy as np
 import torch
@@ -380,6 +381,55 @@ def postprocess_mesh(
                     )
 
     return vertices, faces
+
+
+def _clean_mesh_arrays(vertices: np.ndarray, faces: np.ndarray):
+    mesh = trimesh.Trimesh(
+        vertices=np.asarray(vertices, dtype=np.float64),
+        faces=np.asarray(faces, dtype=np.int64),
+        process=False,
+    )
+    mesh.remove_unreferenced_vertices()
+    if hasattr(mesh, "unique_faces"):
+        mesh.update_faces(mesh.unique_faces())
+    if hasattr(mesh, "nondegenerate_faces"):
+        mesh.update_faces(mesh.nondegenerate_faces())
+    mesh.remove_unreferenced_vertices()
+    return (
+        np.asarray(mesh.vertices, dtype=np.float32),
+        np.asarray(mesh.faces, dtype=np.int64),
+    )
+
+
+def _bounded_source_runtime_mesh(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    max_faces: int,
+    verbose: bool = False,
+):
+    mesh = _open3d_mesh_from_arrays(vertices, faces)
+    before = {
+        "vertices": int(np.asarray(mesh.vertices).shape[0]),
+        "faces": int(np.asarray(mesh.triangles).shape[0]),
+    }
+    if before["faces"] > max_faces:
+        mesh = mesh.simplify_quadric_decimation(
+            target_number_of_triangles=max_faces,
+            boundary_weight=20.0,
+        )
+        mesh = _clean_open3d_mesh(mesh)
+    mesh = _collapse_skinny_open3d_triangles(
+        mesh,
+        verbose=verbose,
+        label="Game runtime source sliver cleanup",
+    )
+    out_vertices = np.asarray(mesh.vertices, dtype=np.float32)
+    out_faces = np.asarray(mesh.triangles, dtype=np.int64)
+    after = {
+        "vertices": int(out_vertices.shape[0]),
+        "faces": int(out_faces.shape[0]),
+    }
+    return out_vertices, out_faces, {"before": before, "after": after}
 
 
 def resolve_game_target_faces(face_count, target_faces=None):
@@ -1468,6 +1518,7 @@ def to_glb(
     experimental_target_faces: Optional[int] = None,
     experimental_quad_path: Optional[str] = None,
     experimental_normal_path: Optional[str] = None,
+    experimental_source_is_clean: bool = False,
     debug: bool = False,
     verbose: bool = True,
     with_mesh_postprocess=True,
@@ -1501,20 +1552,38 @@ def to_glb(
     if experimental_retopo:
         from sam3d_objects.experimental_retopo import retopologize, write_quad_obj
 
-        experimental_reference_vertices = vertices.copy()
-        experimental_reference_faces = faces.copy()
         if verbose:
-            tqdm.write("Building temporary smooth decoder guide for quad fitting")
-        experimental_guide_vertices, experimental_guide_faces = postprocess_mesh(
-            experimental_reference_vertices.copy(),
-            experimental_reference_faces.copy(),
-            simplify=True,
-            simplify_ratio=0.90,
-            fill_holes=False,
-            remove_floaters=True,
-            floater_frac=0.005,
-            verbose=verbose,
-        )
+            tqdm.write(
+                "Loading mesh.glb source for game fitting"
+                if experimental_source_is_clean
+                else "Building cleaned source mesh for quad fitting"
+            )
+        if experimental_source_is_clean:
+            experimental_reference_vertices, experimental_reference_faces = _clean_mesh_arrays(
+                vertices.copy(),
+                faces.copy(),
+            )
+        else:
+            source_simplify = simplify > 0
+            source_simplify_ratio = simplify if source_simplify else 0.90
+            experimental_reference_vertices, experimental_reference_faces = postprocess_mesh(
+                vertices.copy(),
+                faces.copy(),
+                simplify=source_simplify,
+                simplify_ratio=source_simplify_ratio,
+                fill_holes=fill_holes,
+                fill_holes_max_hole_size=fill_holes_max_size,
+                fill_holes_max_hole_nbe=int(250 * np.sqrt(max(0.0, 1 - source_simplify_ratio))),
+                fill_holes_resolution=fill_holes_resolution,
+                fill_holes_num_views=fill_holes_num_views,
+                remove_floaters=True,
+                floater_frac=0.01,
+                debug=debug,
+                verbose=verbose,
+            )
+        _emit_progress(progress_callback, "Source mesh cleanup", 1)
+        experimental_guide_vertices = experimental_reference_vertices
+        experimental_guide_faces = experimental_reference_faces
         splat_points = app_rep.get_xyz.detach().float().cpu().numpy()
         splat_scales = app_rep.get_scaling.detach().float().cpu().numpy()
         splat_rotations = app_rep.get_rotation.detach().float().cpu().numpy()
@@ -1524,19 +1593,191 @@ def to_glb(
             * 0.28209479177387814
             + 0.5
         )
-        result = retopologize(
-            vertices,
-            faces,
-            target_faces=experimental_target_faces,
-            verbose=verbose,
-            splat_points=splat_points,
-            splat_scales=splat_scales,
-            splat_rotations=splat_rotations,
-            splat_opacity=splat_opacity,
-            guide_vertices=experimental_guide_vertices,
-            guide_faces=experimental_guide_faces,
+        max_game_vertices = int(os.environ.get("SAM3D_GAME_MAX_VERTICES", "10000"))
+        max_game_faces = int(os.environ.get("SAM3D_GAME_MAX_FACES", "20000"))
+        runtime_source_fallback = False
+        skip_runtime_cleanup = False
+        source_within_budget = (
+            experimental_reference_vertices.shape[0] <= max_game_vertices
+            and experimental_reference_faces.shape[0] <= max_game_faces
         )
-        vertices, faces = result.vertices, result.faces
+        use_budget_source = (
+            experimental_source_is_clean
+            and source_within_budget
+            and os.environ.get("SAM3D_GAME_USE_SOURCE_WHEN_WITHIN_BUDGET", "1").strip().lower()
+            not in ("0", "false", "no", "off")
+        )
+        if use_budget_source:
+            if verbose:
+                tqdm.write(
+                    "mesh.glb is already inside the game budget; using source geometry "
+                    f"({experimental_reference_vertices.shape[0]:,}v/"
+                    f"{experimental_reference_faces.shape[0]:,}f)"
+                )
+            vertices = experimental_reference_vertices.copy()
+            faces = experimental_reference_faces.copy()
+            runtime_source_fallback = True
+            skip_runtime_cleanup = True
+            result = SimpleNamespace(
+                vertices=vertices,
+                faces=faces,
+                quads=np.empty((0, 4), dtype=np.int64),
+                repair_faces=faces,
+                stats={
+                    "surface_style": "source-glb-runtime",
+                    "runtime_source_fallback": {
+                        "reason": "mesh.glb already within game vertex/face budget",
+                        "source_vertices": int(vertices.shape[0]),
+                        "source_faces": int(faces.shape[0]),
+                        "max_vertices": max_game_vertices,
+                        "max_faces": max_game_faces,
+                    },
+                },
+            )
+        else:
+            try:
+                result = retopologize(
+                    experimental_reference_vertices,
+                    experimental_reference_faces,
+                    target_faces=experimental_target_faces,
+                    verbose=verbose,
+                    splat_points=splat_points,
+                    splat_scales=splat_scales,
+                    splat_rotations=splat_rotations,
+                    splat_opacity=splat_opacity,
+                    guide_vertices=experimental_guide_vertices,
+                    guide_faces=experimental_guide_faces,
+                )
+                vertices, faces = result.vertices, result.faces
+            except RuntimeError as exc:
+                fallback_enabled = os.environ.get(
+                    "SAM3D_GAME_FALLBACK_ON_RETOPO_FAILURE", "1"
+                ).strip().lower() not in ("0", "false", "no", "off")
+                if not fallback_enabled:
+                    raise
+                vertices, faces, fallback_stats = _bounded_source_runtime_mesh(
+                    experimental_reference_vertices,
+                    experimental_reference_faces,
+                    max_faces=max_game_faces,
+                    verbose=verbose,
+                )
+                if vertices.size == 0 or faces.size == 0:
+                    raise
+                runtime_source_fallback = True
+                skip_runtime_cleanup = True
+                if verbose:
+                    tqdm.write(
+                        "Quad retopo failed quality checks; using bounded source runtime "
+                        f"({fallback_stats['before']['vertices']:,}v/"
+                        f"{fallback_stats['before']['faces']:,}f -> "
+                        f"{fallback_stats['after']['vertices']:,}v/"
+                        f"{fallback_stats['after']['faces']:,}f)"
+                    )
+                result = SimpleNamespace(
+                    vertices=vertices,
+                    faces=faces,
+                    quads=np.empty((0, 4), dtype=np.int64),
+                    repair_faces=faces,
+                    stats={
+                        "surface_style": "source-budget-runtime",
+                        "runtime_source_fallback": {
+                            "reason": "quad retopo failed quality checks",
+                            "retopo_error": str(exc),
+                            "max_vertices": max_game_vertices,
+                            "max_faces": max_game_faces,
+                            **fallback_stats,
+                        },
+                    },
+                )
+        if (
+            not skip_runtime_cleanup
+            and os.environ.get("SAM3D_GAME_RETOPO_SLIVER_CLEANUP", "1").strip().lower()
+            not in ("0", "false", "no", "off")
+        ):
+            before_vertices = int(vertices.shape[0])
+            before_faces = int(faces.shape[0])
+            sliver_mesh = _open3d_mesh_from_arrays(vertices, faces)
+            sliver_mesh = _collapse_skinny_open3d_triangles(
+                sliver_mesh,
+                verbose=verbose,
+                label="Quad retopo runtime sliver cleanup",
+            )
+            sliver_mesh = _clean_open3d_mesh(sliver_mesh)
+            cleaned_vertices = np.asarray(sliver_mesh.vertices, dtype=np.float32)
+            cleaned_faces = np.asarray(sliver_mesh.triangles, dtype=np.int64)
+            if cleaned_vertices.size and cleaned_faces.size:
+                vertices, faces = cleaned_vertices, cleaned_faces
+                result.stats["runtime_sliver_cleanup"] = {
+                    "vertices_before": before_vertices,
+                    "faces_before": before_faces,
+                    "vertices_after": int(vertices.shape[0]),
+                    "faces_after": int(faces.shape[0]),
+                }
+        source_fallback_limit = int(os.environ.get("SAM3D_GAME_RETOPO_SOURCE_FALLBACK_MAX_FACES", "20000"))
+        source_fallback_ratio = float(os.environ.get("SAM3D_GAME_RETOPO_SOURCE_FALLBACK_RATIO", "1.25"))
+        source_faces_count = int(experimental_reference_faces.shape[0])
+        if (
+            source_faces_count > 0
+            and source_faces_count <= source_fallback_limit
+            and faces.shape[0] > int(source_faces_count * source_fallback_ratio)
+        ):
+            if verbose:
+                tqdm.write(
+                    "Quad retopo expanded a modest source mesh; using cleaned source "
+                    f"runtime instead ({faces.shape[0]:,} -> {source_faces_count:,} faces)"
+                )
+            result.stats["runtime_source_fallback"] = {
+                "reason": "retopo expanded modest source mesh",
+                "retopo_faces": int(faces.shape[0]),
+                "source_faces": source_faces_count,
+                "source_face_limit": source_fallback_limit,
+                "ratio_limit": source_fallback_ratio,
+            }
+            vertices = experimental_reference_vertices.copy()
+            faces = experimental_reference_faces.copy()
+            runtime_source_fallback = True
+        if vertices.shape[0] > max_game_vertices or faces.shape[0] > max_game_faces:
+            budget_before = {
+                "vertices": int(vertices.shape[0]),
+                "faces": int(faces.shape[0]),
+            }
+            budget_mesh = _open3d_mesh_from_arrays(
+                experimental_reference_vertices,
+                experimental_reference_faces,
+            )
+            budget_mesh = _clean_open3d_mesh(budget_mesh)
+            if np.asarray(budget_mesh.triangles).shape[0] > max_game_faces:
+                budget_mesh = budget_mesh.simplify_quadric_decimation(
+                    target_number_of_triangles=max_game_faces,
+                    boundary_weight=20.0,
+                )
+                budget_mesh = _clean_open3d_mesh(budget_mesh)
+            budget_mesh = _collapse_skinny_open3d_triangles(
+                budget_mesh,
+                verbose=verbose,
+                label="Game runtime budget sliver cleanup",
+            )
+            budget_vertices = np.asarray(budget_mesh.vertices, dtype=np.float32)
+            budget_faces = np.asarray(budget_mesh.triangles, dtype=np.int64)
+            if budget_vertices.size and budget_faces.size:
+                if verbose:
+                    tqdm.write(
+                        "Grid runtime exceeded the game budget; using bounded cleaned-source runtime "
+                        f"({budget_before['vertices']:,}v/{budget_before['faces']:,}f -> "
+                        f"{budget_vertices.shape[0]:,}v/{budget_faces.shape[0]:,}f)"
+                    )
+                vertices, faces = budget_vertices, budget_faces
+                result.stats["runtime_budget_fallback"] = {
+                    "reason": "grid runtime exceeded game vertex/face budget",
+                    "before": budget_before,
+                    "after": {
+                        "vertices": int(vertices.shape[0]),
+                        "faces": int(faces.shape[0]),
+                    },
+                    "max_vertices": max_game_vertices,
+                    "max_faces": max_game_faces,
+                }
+                runtime_source_fallback = True
         from sam3d_objects.experimental_retopo import transfer_surface_normals
 
         experimental_pre_uv_normals = transfer_surface_normals(
@@ -1547,20 +1788,25 @@ def to_glb(
         )
         if experimental_quad_path:
             export_rotation = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]])
-            write_quad_obj(
-                experimental_quad_path,
-                result.vertices @ export_rotation,
-                result.quads,
-                result.repair_faces,
-            )
+            if runtime_source_fallback:
+                write_quad_obj(
+                    experimental_quad_path,
+                    vertices @ export_rotation,
+                    np.empty((0, 4), dtype=np.int64),
+                    faces,
+                )
+            else:
+                write_quad_obj(
+                    experimental_quad_path,
+                    result.vertices @ export_rotation,
+                    result.quads,
+                    result.repair_faces,
+                )
         experimental_report_stats = result.stats
         if verbose:
             tqdm.write(
-                "After quad retopo: "
-                f"{result.vertices.shape[0]:,} vertices / "
-                f"{result.quads.shape[0]:,} quads + "
-                f"{result.repair_faces.shape[0]:,} repair triangles / "
-                f"{result.faces.shape[0]:,} runtime triangles"
+                "After game runtime mesh: "
+                f"{vertices.shape[0]:,} vertices / {faces.shape[0]:,} triangles"
             )
         _emit_progress(progress_callback, "Quad retopo", 1)
 

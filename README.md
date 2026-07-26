@@ -115,8 +115,8 @@ checkpoints/hf/checkpoints/
 ./run.sh
 ```
 
-That's the whole thing. It asks for the source image(s), output folder, quality,
-and GLB output mode, then runs end to end:
+That's the whole thing. It asks for the source image(s), output folder, and
+quality, then runs end to end:
 
 1. **Images** — choose a single ordinary photo, multiple views of the same
    object, or a folder of images for a sequential overnight batch. The first
@@ -128,9 +128,8 @@ and GLB output mode, then runs end to end:
    `outputs/<batch-name>/<image-name>/`.
 3. **Quality** — diffusion steps for both stages:
    `Low = 10` (default), `Medium = 25`, `High = 50`, or a custom value.
-4. **GLB output** — choose the generated mesh export:
-   `Game` (default), `Unoptimised`, or `Both`.
-5. **Mesh settings** — shown for `Game` or `Both`: target triangle budget.
+4. **Complete mesh output** — the wrapper generates `mesh.glb`, converts it to
+   `mesh.obj`, then creates the textured game asset family.
 
 Output in `outputs/<name>/`:
 
@@ -141,16 +140,22 @@ Output in `outputs/<name>/`:
 | `input_views.txt` | optional manifest of the supplied view paths          |
 | `splat.ply`     | the raw gaussian splat                                 |
 | `slat.pt`       | the sparse latent (input to the mesh decoder)          |
-| `mesh_game.glb` | optional/default quad-retopo game textured mesh        |
-| `mesh_game_quads.obj` | editable quad-dominant game mesh sidecar       |
+| `mesh.glb`      | high-detail textured source mesh                       |
+| `mesh.obj`      | OBJ conversion of `mesh.glb`                           |
+| `mesh.mtl`      | material file for `mesh.obj`                           |
+| `mesh_texture.png` | texture extracted for `mesh.obj`                    |
+| `mesh_game.glb` | textured game runtime mesh                             |
+| `mesh_game.obj` | textured game OBJ                                      |
+| `mesh_game.mtl` | material file for `mesh_game.obj`                      |
+| `mesh_game_texture.png` | texture baked onto the game asset             |
 | `mesh_game_normal.png` | optional tangent normal-map sidecar            |
+| `mesh_game_quads.obj` | editable quad-dominant topology sidecar        |
 | `mesh_game_report.json` | topology and surface-error measurements       |
-| `mesh.glb`      | optional unoptimised high-detail textured mesh         |
 
 Folder batches run one source image at a time. Each image is handled by a fresh
 worker process, then the wrapper converts each successful `splat.ply` to the
-selected GLB output. Failed images are logged to `batch_errors.log` and the queue
-continues.
+complete mesh output family. Failed images are logged to `batch_errors.log` and
+the queue continues.
 
 Multiple views are memory-sensitive. View 1 drives depth and pose; all supplied
 views are averaged into the Stage 1 and Stage 2 condition embeddings before
@@ -158,11 +163,13 @@ generation. Extra views are streamed through the condition embedders one at a
 time to avoid a batch-size memory spike, but they still add depth and
 conditioning work, so 2-4 views is the practical range on a 24 GB Mac.
 
-The `Game` export rebuilds the surface before UV unwrap and texture baking, so
-the texture is baked directly onto the exported game asset. The face target is
-treated as a quality hint, not a hard destructive cap: the exporter may keep
-more faces when a low target would damage the silhouette or texture bake. It uses
-an in-repo signed-distance and QEF dual-contouring implementation:
+The mesh stage builds the cleaned high-detail `mesh.glb` source first, converts
+that GLB to `mesh.obj`, reloads the `mesh.glb` geometry as the game source, then
+fits `mesh_game.glb` before UV unwrap and texture baking. The texture is baked
+directly onto the finalized game asset. The automatic game target aims for
+roughly 2k-10k vertices; it may keep more geometry when a lower count would
+damage the silhouette or texture bake. It uses an in-repo signed-distance and
+QEF dual-contouring implementation:
 
 1. align a bounded grid to the source object's principal frame;
 2. fit one feature-aware vertex per intersected cell;
@@ -173,38 +180,44 @@ an in-repo signed-distance and QEF dual-contouring implementation:
 7. measure bidirectional surface error and raise the grid resolution when the
    requested budget loses too much shape.
 
-No external retopology executable or service is used. The OBJ sidecar preserves
-editable quads; the GLB is triangulated for runtime compatibility and receives
-its texture after the game topology has been finalized. An optional tangent
-normal-map sidecar is baked from the untouched decoded surface for shallow
-detail. Local transition or repair triangles may appear around adaptively refined
-patches or where multiple source sheets meet inside one grid cell; their counts
-are recorded in the JSON report.
+No external retopology executable or service is used. The topology sidecar
+preserves editable quads where the grid fit succeeds; the GLB is triangulated for
+runtime compatibility and receives its texture after the game topology has been
+finalized. A tangent normal-map sidecar is baked from the cleaned high-detail
+source surface for shallow detail. Local transition or repair triangles may
+appear around adaptively refined patches or where multiple source sheets meet
+inside one grid cell; their counts are recorded in the JSON report.
 
-`Both` creates `mesh_game.glb` first and then `mesh.glb` for side-by-side
-comparison.
+For open or thin multi-part objects, the quad builder can occasionally produce a
+manifold but heavier runtime mesh than the cleaned source. In that case the game
+export falls back to the cleaned source mesh instead of writing a larger, worse
+`mesh_game.glb`.
 
-GLB files are runtime meshes and are stored as triangles. Targets below 500
-faces are rejected to avoid accidentally destroying silhouettes.
+GLB files are runtime meshes and are stored as triangles. Set
+`SAM3D_GAME_TARGET_VERTICES=2000..10000` to force a vertex target; leave it unset
+for automatic quality-preserving targeting.
 
-**Re-bake the mesh only** (skips the expensive splat step) from an existing
-`splat.ply` + `slat.pt`:
+**Rebuild the mesh outputs only** (skips the expensive splat step):
 
 ```bash
 ./run.sh glb outputs/<name>
 ```
 
-**Create only the game mesh** from an existing result folder:
+If `mesh.glb` already exists and is loadable, this command skips the mesh decoder
+and optimizes that source GLB directly into the game asset family. If `mesh.glb`
+is missing, corrupt, or `SAM3D_GAME_REBUILD_SOURCE_GLB=1` is set, `slat.pt` is
+required so the high-detail source mesh can be rebuilt first.
+
+**Compare source and game meshes from 12 directions**:
 
 ```bash
-./run.sh game outputs/<name> 2000
+python tools/compare_glb_views.py outputs/<name>
 ```
 
-Use `auto` instead of a number to pick a target automatically.
+This writes overlays to `outputs/<name>/comparison_12views/`.
 
-The face value is the initial runtime-triangle budget. The quality gate may use
-more faces when necessary. The main quad-retopo limits can be adjusted without
-changing code. The environment variable names are kept stable for compatibility:
+The main quad-retopo limits can be adjusted without changing code. Some
+environment variable names are kept stable for compatibility:
 
 | Variable | Default | Purpose |
 |----------|--------:|---------|
@@ -230,6 +243,15 @@ changing code. The environment variable names are kept stable for compatibility:
 | `SAM3D_EXPERIMENTAL_POLISH_CHAIN_WEIGHT` | `0.32` | sharp-edge curve fairing strength |
 | `SAM3D_EXPERIMENTAL_SPLAT_GEOMETRY_WEIGHT` | `0.0` | optional splat influence over geometry; appearance still comes from splats |
 | `SAM3D_EXPERIMENTAL_DIRECT_COLOR` | `0` | use faster direct splat color instead of the smoother streamed texture bake |
+| `SAM3D_GAME_REBUILD_SOURCE_GLB` | `0` | rebuild `mesh.glb` before game export even when it already exists |
+| `SAM3D_GAME_TARGET_VERTICES` | `auto` | optional game vertex target from 2,000 to 10,000 |
+| `SAM3D_GAME_MAX_VERTICES` | `10000` | source meshes at or below this vertex count can be used directly for game output |
+| `SAM3D_GAME_MAX_FACES` | `20000` | hard runtime triangle budget for bounded source fallback |
+| `SAM3D_GAME_USE_SOURCE_WHEN_WITHIN_BUDGET` | `1` | keep `mesh.glb` geometry exactly when it is already game-sized |
+| `SAM3D_GAME_FALLBACK_ON_RETOPO_FAILURE` | `1` | use a bounded source-derived runtime mesh instead of failing when grid retopo quality checks reject |
+| `SAM3D_GAME_RETOPO_SOURCE_FALLBACK_MAX_FACES` | `20000` | allow source fallback only when the cleaned source is already game-sized |
+| `SAM3D_GAME_RETOPO_SOURCE_FALLBACK_RATIO` | `1.25` | fallback when retopo produces this much more runtime geometry than the source |
+| `SAM3D_EXPERIMENTAL_REJECT_SKINNY_TOPOLOGY` | `0` | turn skinny topology warnings back into hard failures |
 
 ---
 
@@ -243,8 +265,8 @@ Generated crate sample:
 
 | Result | Face budget | File |
 |--------|------------:|------|
-| Game mesh | target 2,000 | [`outputs/crate/mesh_game.glb`](outputs/crate/mesh_game.glb) |
-| Unoptimised mesh | 14,994 | [`outputs/crate/mesh.glb`](outputs/crate/mesh.glb) |
+| Game mesh | automatic | [`outputs/crate/mesh_game.glb`](outputs/crate/mesh_game.glb) |
+| Source mesh | high detail | [`outputs/crate/mesh.glb`](outputs/crate/mesh.glb) |
 
 Open either `.glb` link on GitHub to use its built-in rotatable 3D viewer.
 

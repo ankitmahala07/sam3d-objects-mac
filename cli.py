@@ -7,7 +7,7 @@ Streamlined full pipeline:
        Images are treated as raw photos — the background is removed here with
        rembg, so you never need to pre-extract them.
     2. Ask for an output folder name  (created as  ./outputs/<name>/ )
-    3. Pick quality and export mode
+    3. Pick quality
     4. Run the full 3D pipeline immediately  (voxel → gaussian splat)
 
 Writes  extracted.png, optional extracted_view_*.png, splat.ply, slat.pt
@@ -42,6 +42,9 @@ def err(msg):   print(f"  {R}✗{RST}   {msg}")
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+DEFAULT_EXPORT_MODE = "complete"
+DEFAULT_GAME_TARGET = "auto"
+DEFAULT_GAME_METHOD = "quality"
 
 
 def int_env(name, default=0):
@@ -52,11 +55,7 @@ def int_env(name, default=0):
 
 
 def export_progress_units(mode):
-    if mode == "game":
-        return 11
-    if mode == "both":
-        return 21
-    return 10
+    return 18
 
 
 def ask(prompt, default=None):
@@ -248,16 +247,12 @@ def _multi_view_note(image_views):
         ok("Single-image conditioning")
 
 
-def _image_extract_step(export_mode):
-    return (
-        "STEP 6"
-        if export_mode in ("game", "both")
-        else "STEP 5"
-    )
+def _image_extract_step():
+    return "STEP 4"
 
 
-def _run_rembg(image_views, export_mode):
-    hdr(f"{_image_extract_step(export_mode)} — EXTRACT (rembg)")
+def _run_rembg(image_views):
+    hdr(f"{_image_extract_step()} — EXTRACT (rembg)")
     step("Running rembg foreground detection…")
     return _extract_masks(image_views)
 
@@ -343,48 +338,16 @@ def get_steps():
     return steps
 
 
-def get_export_mode():
-    hdr("STEP 4 — GLB OUTPUT")
-    print(f"  {B}?{RST}  Which GLB should be generated?")
-    print(f"     {G}▶{RST} [1] Game        ·  quad-retopo low-poly game mesh (default)")
-    print(f"       [2] Unoptimised ·  original high-detail mesh")
-    print(f"       [3] Both        ·  mesh_game.glb + mesh.glb")
-    while True:
-        raw = ask("Enter 1–3", 1)
-        if raw == "1":
-            ok("Game output → mesh_game.glb")
-            return "game"
-        if raw == "2":
-            ok("Unoptimised output → mesh.glb")
-            return "unoptimised"
-        if raw == "3":
-            ok("Both outputs → mesh_game.glb and mesh.glb")
-            return "both"
-        err("Enter a number between 1 and 3.")
-
-
-def get_game_options(export_mode):
-    if export_mode not in ("game", "both"):
-        return "auto", "quality"
-
-    hdr("STEP 5 — GAME MESH")
-    print(f"  {B}?{RST}  Target triangle budget for the game mesh")
-    print(f"       The quad-retopo exporter may keep more faces when needed to preserve the object.")
-    print(f"       Examples: 2000 for simple props, 10000 for complex objects")
-    while True:
-        target = ask("Target faces, or auto", "auto").strip().lower()
-        if target == "auto":
-            break
-        if target.isdigit() and int(target) >= 500:
-            break
-        err("Enter auto or a number >= 500.")
-
-    ok(f"Game mesh: quad-retopo target={target}")
-    return target, "quality"
-
-
 # ── full pipeline ─────────────────────────────────────────────────────────────
-def run_pipeline(image_views, masks, obj_dir, steps, export_mode, game_target, game_method):
+def run_pipeline(
+    image_views,
+    masks,
+    obj_dir,
+    steps,
+    export_mode=DEFAULT_EXPORT_MODE,
+    game_target=DEFAULT_GAME_TARGET,
+    game_method=DEFAULT_GAME_METHOD,
+):
     import torch as _t
 
     _validate_views(image_views)
@@ -537,9 +500,6 @@ def _parse_worker_args(argv):
     parser.add_argument("--image", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--steps", required=True, type=int)
-    parser.add_argument("--export-mode", required=True, choices=("game", "unoptimised", "both"))
-    parser.add_argument("--game-target", default="auto")
-    parser.add_argument("--game-method", default="quality")
     return parser.parse_args(argv)
 
 
@@ -555,16 +515,13 @@ def _run_batch_worker(args):
     os.makedirs(args.output_dir, exist_ok=True)
     try:
         image_views = _materialize_job_views({"paths": [args.image]})
-        masks = _run_rembg(image_views, args.export_mode)
+        masks = _run_rembg(image_views)
         ok(f"Output → {args.output_dir}")
         success = run_pipeline(
             image_views,
             masks,
             args.output_dir,
             args.steps,
-            args.export_mode,
-            args.game_target,
-            args.game_method,
         )
         hdr("ITEM DONE")
         return 0 if success else 2
@@ -577,7 +534,7 @@ def _run_batch_worker(args):
         return 1
 
 
-def _run_folder_batch(jobs, batch_root, steps, export_mode, game_target, game_method):
+def _run_folder_batch(jobs, batch_root, steps):
     hdr("BATCH QUEUE")
     ok(f"{len(jobs)} image(s) will run sequentially")
     ok(f"Batch root: {batch_root}")
@@ -598,12 +555,6 @@ def _run_folder_batch(jobs, batch_root, steps, export_mode, game_target, game_me
             obj_dir,
             "--steps",
             str(steps),
-            "--export-mode",
-            export_mode,
-            "--game-target",
-            str(game_target),
-            "--game-method",
-            str(game_method),
         ]
         try:
             result = subprocess.run(cmd, env=os.environ.copy())
@@ -642,20 +593,18 @@ def main():
     jobs, batch_mode = get_image_jobs()
     obj_dir = get_output_folder(batch_mode=batch_mode)
     steps = get_steps()
-    export_mode = get_export_mode()
-    game_target, game_method = get_game_options(export_mode)
 
     if batch_mode:
-        _run_folder_batch(jobs, obj_dir, steps, export_mode, game_target, game_method)
+        _run_folder_batch(jobs, obj_dir, steps)
         hdr("ALL DONE")
         return
 
     image_views = _materialize_job_views(jobs[0])
     # Always extract every supplied view: find the largest foreground component
     # with rembg, then merge that mask into RGBA before generation.
-    masks = _run_rembg(image_views, export_mode)
+    masks = _run_rembg(image_views)
 
-    run_pipeline(image_views, masks, obj_dir, steps, export_mode, game_target, game_method)
+    run_pipeline(image_views, masks, obj_dir, steps)
     hdr("ALL DONE")
 
 
