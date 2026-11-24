@@ -93,7 +93,7 @@ class Gaussian:
     @property
     def get_features(self):
         return (
-            torch.cat((self._features_dc, self._features_rest), dim=2)
+            torch.cat((self._features_dc, self._features_rest), dim=1)
             if self._features_rest is not None
             else self._features_dc
         )
