@@ -34,11 +34,11 @@ class ODESolver:
         x_t = x_init
         for t0, t1 in zip(times[:-1], times[1:]):
             dt = t1 - t0
-            x_t = self.step(dynamics_fn, x_t, t0, dt, *args, **kwargs)
-            yield x_t, t0
+            x_t, velocity = self.step(dynamics_fn, x_t, t0, dt, *args, **kwargs)
+            yield x_t, t1, velocity
 
     def solve(self, dynamics_fn, x_init, times, *args, **kwargs):
-        for x_t, _ in self.solve_iter(dynamics_fn, x_init, times, *args, **kwargs):
+        for x_t, _, _velocity in self.solve_iter(dynamics_fn, x_init, times, *args, **kwargs):
             pass
         return x_t
 
@@ -48,7 +48,7 @@ class Euler(ODESolver):
     def step(self, dynamics_fn, x_t, t, dt, *args, **kwargs):
         velocity = dynamics_fn(x_t, t, *args, **kwargs)
         x_tp1 = linear_approximation_step(x_t, dt, velocity)
-        return x_tp1
+        return x_tp1, velocity
 
 
 # https://arxiv.org/abs/2505.05470
@@ -79,7 +79,7 @@ class SDE(ODESolver):
 
         prev_sample = tree_tensor_map(add_noise, prev_sample_mean)
 
-        return prev_sample
+        return prev_sample, velocity
 
 
 # https://en.wikipedia.org/wiki/Midpoint_method
@@ -87,11 +87,11 @@ class Midpoint(ODESolver):
     def step(self, dynamics_fn, x_t, t, dt, *args, **kwargs):
         half_dt = 0.5 * dt
 
-        x_mid = Euler.step(self, dynamics_fn, x_t, t, half_dt, *args, **kwargs)
+        x_mid, _velocity_half = Euler.step(self, dynamics_fn, x_t, t, half_dt, *args, **kwargs)
 
         velocity_mid = dynamics_fn(x_mid, t + half_dt, *args, **kwargs)
         x_tp1 = linear_approximation_step(x_t, dt, velocity_mid)
-        return x_tp1
+        return x_tp1, velocity_mid
 
 
 # https://en.wikipedia.org/wiki/Runge%E2%80%93Kutta_methods
@@ -123,4 +123,4 @@ class RungeKutta4(ODESolver):
 
         velocity_k = tree_tensor_map(compute_velocity, k1, k2, k3, k4)
         x_tp1 = linear_approximation_step(x_t, dt, velocity_k)
-        return x_tp1
+        return x_tp1, velocity_k

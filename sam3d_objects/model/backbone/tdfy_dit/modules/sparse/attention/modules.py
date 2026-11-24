@@ -126,6 +126,7 @@ class SparseMultiHeadAttention(nn.Module):
         self,
         x: Union[SparseTensor, torch.Tensor],
         context: Optional[Union[SparseTensor, torch.Tensor]] = None,
+        attn_bias: Optional[torch.Tensor] = None,
     ) -> Union[SparseTensor, torch.Tensor]:
         if self._type == "self":
             qkv = self._linear(self.to_qkv, x)
@@ -161,7 +162,7 @@ class SparseMultiHeadAttention(nn.Module):
                 k, v = kv.unbind(dim=1)
                 k = self.k_rms_norm(k)
                 kv = kv.replace(torch.stack([k.feats, v.feats], dim=1))
-            h = sparse_scaled_dot_product_attention(q, kv)
+            h = sparse_scaled_dot_product_attention(q, kv, attn_bias=attn_bias)
         h = self._reshape_chs(h, (-1,))
         h = self._linear(self.to_out, h)
         return h

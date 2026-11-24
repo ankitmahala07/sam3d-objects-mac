@@ -106,7 +106,7 @@ def sparse_scaled_dot_product_attention(
     ...
 
 
-def sparse_scaled_dot_product_attention(*args, **kwargs):
+def sparse_scaled_dot_product_attention(*args, attn_bias=None, **kwargs):
     arg_names_dict = {1: ["qkv"], 2: ["q", "kv"], 3: ["q", "k", "v"]}
     num_all_args = len(args) + len(kwargs)
     assert (
@@ -256,7 +256,25 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
                 sum(kv_seqlen),
             ], f"SparseScaledDotProductSelfAttention: v shape mismatch"
 
-    if ATTN == "xformers":
+    if attn_bias is not None:
+        # GenIA visibility bias (MPS port). Upstream routes a bias through the
+        # xformers branch only and raises NotImplementedError under other
+        # backends; here it is honoured under any backend: a bias object with
+        # .attend (GenIA's FootprintBias) runs the attention itself, and a
+        # tensor bias goes through the SDPA block-diagonal helper.
+        if num_all_args == 1:
+            q, k, v = qkv.unbind(dim=1)
+        elif num_all_args == 2:
+            k, v = kv.unbind(dim=1)
+        q = q.unsqueeze(0)
+        k = k.unsqueeze(0)
+        v = v.unsqueeze(0)
+        if hasattr(attn_bias, "attend"):
+            out = attn_bias.attend(q, k, v, q_seqlen, kv_seqlen)
+        else:
+            from .masked_sdpa import sdpa_blockdiag_with_bias
+            out = sdpa_blockdiag_with_bias(q, k, v, q_seqlen, kv_seqlen, attn_bias)
+    elif ATTN == "xformers":
         if num_all_args == 1:
             q, k, v = qkv.unbind(dim=1)
         elif num_all_args == 2:
