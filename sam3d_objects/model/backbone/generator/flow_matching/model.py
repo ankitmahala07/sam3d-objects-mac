@@ -211,7 +211,15 @@ class FlowMatching(Base):
         progress_callback = getattr(self, "progress_callback", None)
         total_steps = max(0, len(t_seq) - 1)
 
-        for step_idx, (x_t, t) in enumerate(self._solver.solve_iter(
+        # noise_init_override: sets x_0 only (not frozen at every step)
+        noise_init_override = kwargs_conditionals.pop("noise_init_override", None)
+        if noise_init_override is not None:
+            if type(x_0) == dict:
+                x_0.update(noise_init_override)
+            else:
+                x_0 = noise_init_override
+
+        for step_idx, (x_t, t, _velocity) in enumerate(self._solver.solve_iter(
             self._generate_dynamics,
             x_0,
             t_seq,
@@ -354,7 +362,7 @@ class ConditionalFlowMatching(FlowMatching):
                 else:
                     x_0 = noise_override
 
-        for step_idx, (x_t, t) in enumerate(self._solver.solve_iter(
+        for step_idx, (x_t, t, _velocity) in enumerate(self._solver.solve_iter(
             self._generate_dynamics,
             x_0,
             t_seq,

@@ -41,6 +41,7 @@ class ShortCut(FlowMatching):
         self.fm_eps_max = fm_eps_max
         self.batch_mode = batch_mode
         self.cfg_modalities = cfg_modalities
+        self._velocity_transform = None  # Optional callback(t, velocity_dict, x_t) -> velocity_dict
 
     def _generate_d(self, x1):
         """
@@ -424,7 +425,18 @@ class ShortCut(FlowMatching):
         progress_callback = getattr(self, "progress_callback", None)
         total_steps = max(0, len(t_seq) - 1)
 
-        for step_idx, (x_t, t) in enumerate(self._solver.solve_iter(
+        # noise_init_override: sets x_0 only (not frozen at every step)
+        noise_init_override = kwargs_conditionals.pop("noise_init_override", None)
+        if noise_init_override is not None:
+            if type(x_0) == dict:
+                x_0.update(noise_init_override)
+            else:
+                x_0 = noise_init_override
+
+        # step_callback: optional callable(t, x_t, velocity) invoked after each ODE step
+        step_callback = kwargs_conditionals.pop("step_callback", None)
+
+        for step_idx, (x_t, t, velocity) in enumerate(self._solver.solve_iter(
             self._generate_dynamics,
             x_0,
             t_seq,
@@ -434,6 +446,8 @@ class ShortCut(FlowMatching):
         ), start=1):
             if progress_callback is not None:
                 progress_callback(step_idx, total_steps)
+            if step_callback is not None:
+                step_callback(t, x_t, velocity)
             yield t, x_t, ()
 
     def _generate_dynamics(
@@ -445,10 +459,14 @@ class ShortCut(FlowMatching):
         **kwargs_conditionals,
     ):
         """Generate dynamics for ODE solver"""
+        t_raw = t  # unscaled, 0-1 range - needed for velocity_transform
         t = torch.tensor(
             [t * self.time_scale], device=_get_device(x_t), dtype=torch.float32
         )
         d = torch.tensor(
             [d * self.time_scale], device=_get_device(x_t), dtype=torch.float32
         )
-        return self.reverse_fn(x_t, t, *args_conditionals, d=d, **kwargs_conditionals)
+        velocity = self.reverse_fn(x_t, t, *args_conditionals, d=d, **kwargs_conditionals)
+        if self._velocity_transform is not None:
+            velocity = self._velocity_transform(t_raw, velocity, x_t)
+        return velocity

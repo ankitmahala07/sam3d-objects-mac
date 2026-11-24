@@ -7,6 +7,13 @@ try:
     from pytorch3d.structures import Pointclouds
     from pytorch3d.transforms import quaternion_to_matrix
 except ImportError:
+    # GenIA port: the alt3d shim is flat (pytorch3d.renderer module, no
+    # renderer.cameras submodule); retry against the flat locations before
+    # giving up. Real pytorch3d installs take the first branch unchanged.
+    from pytorch3d.renderer import PerspectiveCameras
+    from pytorch3d.structures import Pointclouds
+    from pytorch3d.transforms import quaternion_to_matrix
+except ImportError:
     PerspectiveCameras = Pointclouds = quaternion_to_matrix = None
 
 from sam3d_objects.data.dataset.tdfy.transforms_3d import compose_transform
